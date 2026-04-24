@@ -1,0 +1,41 @@
+# Build outputs
+/build/
+/build-local/
+/.worktrees/
+/worktrees/
+/build-vs/
+/build-vs-*/
+/out/
+/Debug/
+/Release/
+/x64/
+
+# IDE / editor private state
+/.vs/
+/.vscode/
+*.VC.db
+*.VC.opendb
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.ipch
+
+# CMake / CTest local generated files
+/CMakeSettings.json
+/CMakeUserPresets.json
+/Testing/
+CMakeCache.txt
+CTestTestfile.cmake
+cmake_install.cmake
+compile_commands.json
+
+# Runtime UI state
+/imgui.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.stdout.log
+*.stderr.log
