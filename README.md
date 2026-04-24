@@ -34,20 +34,25 @@ Binary outputs can be found in build/bin and build/lib:
 
 ### Windows workflow
 
-Default regression and manual performance runs are intentionally separated now.
+Default regression, manual rule acceptance, and training smoke are intentionally separated now. The current gate order is:
+
+`baseline snapshot -> default regression -> manual GUI rule acceptance -> TD/self-play smoke -> Phase 4B selection work`
 
 ```powershell
 pwsh ./scripts/workflow.ps1 -Configuration Debug
 pwsh ./scripts/workflow.ps1 -Configuration Release
+pwsh ./scripts/manual-acceptance.ps1
 pwsh ./scripts/perf-runner.ps1
 pwsh ./scripts/benchmark-train.ps1
 ```
 
-- `workflow.ps1` configures, builds, runs the default CTest suite, and checks for lingering `surakarta-*.exe` processes under the workspace.
+- `workflow.ps1` configures, builds, runs the default CTest suite, and checks for lingering `surakarta-*.exe` processes under the workspace. If the selected build directory still points at a stale source tree in `CMakeCache.txt`, the script clears that generated build directory and reconfigures from the current repo root before continuing.
 - The default CTest suite contains deterministic regression only: `surakarta-bitboard-selftest`, `surakarta-dev-session-selftest`, and GUI smoke tests.
 - `surakarta-benchmark statistic -n 10` is no longer part of default regression. Keep it as a manual legacy command only.
+- `manual-acceptance.ps1` builds `surakarta-gui`, creates an archive scaffold under `build-local/manual-acceptance/<timestamp>/`, copies the checklist template, records the current git commit, and launches the GUI for the required manual rule scenarios.
 - `perf-runner.ps1` runs the fixed perf suite serially for `opening`, `middlegame` (`game1`), and `endgame` (`game6`) across depths `6/7/8` and threads `1/2/4`. Reports are written to `build-local/perf/<timestamp>/`.
-- `benchmark-train.ps1` is a manual training/evaluation entrypoint. It builds `surakarta-benchmark`, exports bootstrap weights, trains a candidate, runs loading smoke plus `bitboard-eval`, and archives logs, weights, and reports to `build-local/training/<timestamp>/`.
+- `benchmark-train.ps1` is the formal TD/self-play smoke gate. It builds `surakarta-benchmark`, runs two identical training passes with the same seed, verifies `candidate.bin != bootstrap.bin`, checks `bitboard-search` and `bitboard-benchmark` loading, writes `bitboard-eval` JSON/text reports, and compares hashes between the two runs. Artifacts are archived under `build-local/training/<timestamp>/run-1/` and `run-2/`, with `repro-summary.json` and `repro-summary.txt` stored at the timestamp root.
+- Until the baseline snapshot, manual rule acceptance, and TD/self-play smoke gate all pass on fresh artifacts, Phase 4B checkpoint ranking and extended benchmark selection stay frozen.
 
 ### Benchmark CLI
 

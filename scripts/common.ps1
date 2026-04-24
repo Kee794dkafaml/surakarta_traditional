@@ -45,6 +45,74 @@ function Get-CMakeCacheValue {
     return $match.Matches[0].Groups[1].Value
 }
 
+function Get-NormalizedFullPath {
+    param([string]$Path)
+
+    return [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+}
+
+function Test-SurakartaGitIgnoredPath {
+    param(
+        [string]$RepoRoot,
+        [string]$Path
+    )
+
+    if (-not (Test-Path (Join-Path $RepoRoot '.git'))) {
+        return $false
+    }
+
+    $relativePath = [System.IO.Path]::GetRelativePath($RepoRoot, $Path)
+    if ([string]::IsNullOrWhiteSpace($relativePath) -or $relativePath.StartsWith('..')) {
+        return $false
+    }
+
+    $git = Get-Command git -ErrorAction SilentlyContinue
+    if ($null -eq $git) {
+        return $false
+    }
+
+    & $git.Source -C $RepoRoot check-ignore -q -- $relativePath
+    return $LASTEXITCODE -eq 0
+}
+
+function Clear-StaleSurakartaBuildDir {
+    param(
+        [string]$BuildDir,
+        [string]$RepoRoot = (Get-SurakartaRepoRoot)
+    )
+
+    $cacheRoot = Get-CMakeCacheValue -BuildDir $BuildDir -Name 'CMAKE_HOME_DIRECTORY'
+    if (-not $cacheRoot) {
+        return $false
+    }
+
+    $normalizedRepoRoot = Get-NormalizedFullPath -Path $RepoRoot
+    $normalizedBuildDir = Get-NormalizedFullPath -Path $BuildDir
+    $normalizedCacheRoot = Get-NormalizedFullPath -Path $cacheRoot
+
+    if ($normalizedCacheRoot.Equals($normalizedRepoRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+
+    $repoPrefix = $normalizedRepoRoot + '\'
+    if (-not $normalizedBuildDir.StartsWith($repoPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to clear stale build directory outside repo root: $normalizedBuildDir"
+    }
+
+    $relativePath = [System.IO.Path]::GetRelativePath($normalizedRepoRoot, $normalizedBuildDir)
+    $looksLikeGeneratedBuildDir = $relativePath -like 'build*' -or
+                                  $relativePath -like '.worktrees*' -or
+                                  $relativePath -like 'worktrees*'
+    $ignoredByGit = Test-SurakartaGitIgnoredPath -RepoRoot $normalizedRepoRoot -Path $normalizedBuildDir
+
+    if (-not $ignoredByGit -and -not $looksLikeGeneratedBuildDir) {
+        throw "Refusing to clear non-ignored directory for stale cache recovery: $normalizedBuildDir"
+    }
+
+    Remove-Item -LiteralPath $normalizedBuildDir -Recurse -Force
+    return $true
+}
+
 function Get-DefaultToolPath {
     param(
         [ValidateSet('cmake', 'ctest', 'ninja', 'launchdevshell')]
@@ -134,6 +202,7 @@ function Invoke-SurakartaConfigure {
         [string]$BuildDir = (Get-SurakartaBuildDir -Configuration $Configuration)
     )
 
+    $null = Clear-StaleSurakartaBuildDir -BuildDir $BuildDir
     Import-SurakartaDevShell -BuildDir $BuildDir
     $cmake = Get-CMakePath -BuildDir $BuildDir
     $root = Get-SurakartaRepoRoot

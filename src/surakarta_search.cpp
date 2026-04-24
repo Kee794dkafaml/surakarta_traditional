@@ -247,6 +247,55 @@ NTupleWeightHeader DefaultWeightHeader() {
     return header;
 }
 
+constexpr std::size_t kSerializedWeightHeaderBytes =
+    sizeof(std::uint32_t) +
+    sizeof(std::uint16_t) +
+    sizeof(std::uint16_t) +
+    sizeof(std::uint64_t) +
+    sizeof(std::uint32_t);
+
+static_assert(sizeof(NTupleWeightHeader) >= kSerializedWeightHeaderBytes,
+              "NTupleWeightHeader cannot shrink below its serialized fields");
+
+bool ReadWeightHeader(std::istream& input, NTupleWeightHeader& header) {
+    header = NTupleWeightHeader{};
+    input.read(reinterpret_cast<char*>(&header.magic), sizeof(header.magic));
+    input.read(reinterpret_cast<char*>(&header.version), sizeof(header.version));
+    input.read(reinterpret_cast<char*>(&header.reserved), sizeof(header.reserved));
+    input.read(reinterpret_cast<char*>(&header.tuple_set_hash), sizeof(header.tuple_set_hash));
+    input.read(reinterpret_cast<char*>(&header.weight_count), sizeof(header.weight_count));
+    if (!input.good()) {
+        return false;
+    }
+
+    constexpr auto padding_bytes = sizeof(NTupleWeightHeader) - kSerializedWeightHeaderBytes;
+    if constexpr (padding_bytes > 0) {
+        auto padding = std::array<char, padding_bytes>{};
+        input.read(padding.data(), static_cast<std::streamsize>(padding.size()));
+        if (!input.good()) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool WriteWeightHeader(std::ostream& output, const NTupleWeightHeader& header) {
+    output.write(reinterpret_cast<const char*>(&header.magic), sizeof(header.magic));
+    output.write(reinterpret_cast<const char*>(&header.version), sizeof(header.version));
+    output.write(reinterpret_cast<const char*>(&header.reserved), sizeof(header.reserved));
+    output.write(reinterpret_cast<const char*>(&header.tuple_set_hash), sizeof(header.tuple_set_hash));
+    output.write(reinterpret_cast<const char*>(&header.weight_count), sizeof(header.weight_count));
+
+    constexpr auto padding_bytes = sizeof(NTupleWeightHeader) - kSerializedWeightHeaderBytes;
+    if constexpr (padding_bytes > 0) {
+        auto padding = std::array<char, padding_bytes>{};
+        output.write(padding.data(), static_cast<std::streamsize>(padding.size()));
+    }
+
+    return output.good();
+}
+
 bool ValidateWeightHeader(const NTupleWeightHeader& header, std::string* error_message) {
     const auto expected = DefaultWeightHeader();
     if (header.magic != expected.magic) {
@@ -1262,8 +1311,7 @@ bool NTupleWeights::LoadBinary(const std::string& file_name) {
     }
 
     auto external_header = NTupleWeightHeader{};
-    input.read(reinterpret_cast<char*>(&external_header), sizeof(external_header));
-    if (!input.good()) {
+    if (!ReadWeightHeader(input, external_header)) {
         return false;
     }
 
@@ -1309,7 +1357,9 @@ bool NTupleWeights::SaveBinary(const std::string& file_name) const {
         quantized[i] = QuantizeWeight(values[i]);
     }
 
-    output.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    if (!WriteWeightHeader(output, header)) {
+        return false;
+    }
     output.write(reinterpret_cast<const char*>(quantized.data()),
                  static_cast<std::streamsize>(sizeof(std::int32_t) * quantized.size()));
     return output.good();
