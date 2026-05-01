@@ -107,7 +107,10 @@ if(SURAKARTA_ENABLE_GUI AND NOT TARGET surakarta-gui)
         COMMAND surakarta-gui --smoke-test --file "${BITBOARD_GUI_TEST_DATA_DIR}/game1.txt")
     add_test(NAME surakarta-gui-smoke-init
         COMMAND surakarta-gui --smoke-test-init)
+    add_test(NAME surakarta-gui-smoke-geometry
+        COMMAND surakarta-gui --smoke-test-geometry)
     set_tests_properties(surakarta-gui-smoke-session PROPERTIES TIMEOUT 10)
     set_tests_properties(surakarta-gui-smoke-init PROPERTIES TIMEOUT 10)
+    set_tests_properties(surakarta-gui-smoke-geometry PROPERTIES TIMEOUT 10)
     install(TARGETS surakarta-gui)
 endif()

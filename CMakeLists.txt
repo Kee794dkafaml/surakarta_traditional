@@ -28,6 +28,3 @@ endif()
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include) 
 add_subdirectory(src)
-if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    add_subdirectory(test)
-endif()

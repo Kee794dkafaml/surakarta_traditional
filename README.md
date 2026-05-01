@@ -4,33 +4,21 @@ This repository is a library for https://github.com/surakarta-game/surakarta-gam
 
 Here you can find the source code for libsurakarta, a library that provides rule management and a simple AI for https://github.com/surakarta-game/surakarta-game, together with a simple CLI tool for benchmark and some unit tests for the library.
 
-Use the following command to clone the repository with dependencies:
+Use the following command to clone the repository:
 ```bash
-git clone https://github.com/surakarta-game/surakarta-core.git --recursive
+git clone https://github.com/surakarta-game/surakarta-core.git
 ```
 
 ## How to compile
 
-You can use GCC, Clang or MSVC to build the project on Linux (or other UNIX-like OS) or Windows. Unit tests are not available for Windows.
+This repository is maintained around the Windows/MSVC toolchain. Visual Studio supports this CMake project well, and the current workflow has been exercised with MSVC.
 
-### Linux
-
-You can compile the project on UNIX-like OS with the following commands:
-```bash
-mkdir build
-cd build
-cmake ..
-make
-```
-
-Binary outputs can be found in build/bin and build/lib:
- - build/bin/surakarta-benchmark: a simple CLI tool for benchmark
- - build/bin/surakarta-test: unit tests
- - build/lib/libsurakarta.a: the library that contains rule manager and the simple AI
-
- ### Windows
-
- You can use Visual Studio to compile this repository. VS supports CMake very well, and we have tested to build this CMake project with MSVC.
+Binary outputs can be found in `build/bin` and `build/lib`:
+ - `build/bin/surakarta-benchmark.exe`: a simple CLI tool for benchmark
+ - `build/bin/surakarta-bitboard-selftest.exe`: deterministic bitboard regression selftest
+ - `build/bin/surakarta-dev-session-selftest.exe`: development session regression selftest
+ - `build/bin/surakarta-gui.exe`: Dear ImGui validation tool
+ - `build/bin/surakarta.dll`: the library that contains rule manager and the simple AI
 
 ### Windows workflow
 
@@ -94,4 +82,4 @@ JSON output includes:
 
  ## Dependencies
 
- All the dependencies are used for testing. So if you don't want to test, all the dependencies are unnecessary.
+ The current Windows workflow does not require extra git submodules. When `SURAKARTA_ENABLE_GUI` is left enabled (the default), the first configure will download `glfw` and `imgui` via `FetchContent`. If you only need the core library and benchmark targets, you can disable the GUI target during configure.

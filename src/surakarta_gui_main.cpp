@@ -28,6 +28,11 @@ using surakarta::bitboard::Square;
 using surakarta::devtools::DevelopmentSession;
 
 constexpr float kPi = 3.14159265358979323846f;
+constexpr float kBoardOuterTrackPaddingSteps = 2.15f;
+constexpr float kBoardLabelPaddingSteps = 0.55f;
+constexpr float kBoardGridSpanSteps = 5.0f;
+constexpr float kBoardVisualSpanSteps = kBoardGridSpanSteps + kBoardOuterTrackPaddingSteps * 2.0f;
+constexpr float kBoardPanelSpanSteps = kBoardVisualSpanSteps + kBoardLabelPaddingSteps * 2.0f;
 
 int DefaultThreadCount() {
     const auto hardware_threads = std::thread::hardware_concurrency();
@@ -38,6 +43,7 @@ int DefaultThreadCount() {
 struct StartupOptions {
     bool smoke_test{false};
     bool smoke_test_init{false};
+    bool smoke_test_geometry{false};
     std::string file_name;
     int depth{4};
     int threads{DefaultThreadCount()};
@@ -59,12 +65,27 @@ struct Palette {
 };
 
 struct BoardLayout {
-    ImVec2 min;
-    ImVec2 max;
-    ImVec2 origin;
-    float step{0.0f};
+    ImVec2 panel_min;
+    ImVec2 panel_max;
+    ImVec2 grid_origin;
+    ImVec2 board_center;
+    float grid_step{0.0f};
+    float outer_track_padding{0.0f};
+    float label_padding{0.0f};
+    float board_span{0.0f};
     float interaction_radius{0.0f};
     float piece_radius{0.0f};
+};
+
+struct CornerLoopSpec {
+    int start_angle{0};
+    int end_angle{0};
+    bool clockwise{false};
+};
+
+struct ArcSweep {
+    float start_radians{0.0f};
+    float end_radians{0.0f};
 };
 
 struct SidebarState {
@@ -133,29 +154,85 @@ void GlfwErrorCallback(int error, const char* description) {
 }
 
 ImVec2 BoardPoint(const BoardLayout& layout, int x, int y) {
-    return ImVec2(layout.origin.x + layout.step * static_cast<float>(x),
-                  layout.origin.y + layout.step * static_cast<float>(y));
+    return ImVec2(layout.grid_origin.x + layout.grid_step * static_cast<float>(x),
+                  layout.grid_origin.y + layout.grid_step * static_cast<float>(y));
 }
 
 float AngleToRadians(int angle) {
     return static_cast<float>(angle) * (kPi * 0.5f);
 }
 
-BoardLayout MakeBoardLayout(ImVec2 top_left, float canvas_size) {
-    const float margin = canvas_size * 0.14f;
+CornerLoopSpec CornerLoopForCorner(std::size_t corner_index) {
+    constexpr auto kCornerLoops = std::array<CornerLoopSpec, 4>{
+        CornerLoopSpec{0, 1, true},
+        CornerLoopSpec{1, 2, true},
+        CornerLoopSpec{2, 3, true},
+        CornerLoopSpec{3, 0, true},
+    };
+    return kCornerLoops.at(corner_index);
+}
+
+ArcSweep ResolveArcSweep(int start_angle, int end_angle, bool clockwise) {
+    auto start = AngleToRadians(start_angle);
+    auto end = AngleToRadians(end_angle);
+    if (clockwise) {
+        if (end > start) {
+            end -= kPi * 2.0f;
+        }
+    } else if (end < start) {
+        end += kPi * 2.0f;
+    }
+    return ArcSweep{start, end};
+}
+
+void StrokeArc(ImDrawList* draw_list,
+               ImVec2 center,
+               float radius,
+               int start_angle,
+               int end_angle,
+               bool clockwise,
+               ImU32 color,
+               float thickness) {
+    const auto sweep = ResolveArcSweep(start_angle, end_angle, clockwise);
+    const int segments =
+        std::max(12, static_cast<int>(std::abs(sweep.end_radians - sweep.start_radians) / (kPi * 0.5f) * 18.0f));
+    draw_list->PathClear();
+    for (int i = 0; i <= segments; ++i) {
+        const float t = sweep.start_radians +
+                        (sweep.end_radians - sweep.start_radians) *
+                            (static_cast<float>(i) / static_cast<float>(segments));
+        draw_list->PathLineTo(ImVec2(center.x + std::cos(t) * radius, center.y + std::sin(t) * radius));
+    }
+    draw_list->PathStroke(color, ImDrawFlags_None, thickness);
+}
+
+BoardLayout MakeBoardLayout(ImVec2 top_left, ImVec2 available_size) {
+    const float visual_size = std::min(available_size.x, available_size.y);
+    const float grid_step = visual_size / kBoardPanelSpanSteps;
+    const float outer_track_padding = grid_step * kBoardOuterTrackPaddingSteps;
+    const float label_padding = grid_step * kBoardLabelPaddingSteps;
+    const float board_span = grid_step * kBoardGridSpanSteps + outer_track_padding * 2.0f;
+    const float panel_size = board_span + label_padding * 2.0f;
+    const auto centered_offset = ImVec2(std::max(0.0f, (available_size.x - panel_size) * 0.5f),
+                                        std::max(0.0f, (available_size.y - panel_size) * 0.5f));
     BoardLayout layout{};
-    layout.min = top_left;
-    layout.max = ImVec2(top_left.x + canvas_size, top_left.y + canvas_size);
-    layout.origin = ImVec2(top_left.x + margin, top_left.y + margin);
-    layout.step = (canvas_size - margin * 2.0f) / 5.0f;
-    layout.interaction_radius = layout.step * 0.36f;
-    layout.piece_radius = layout.step * 0.28f;
+    layout.panel_min = ImVec2(top_left.x + centered_offset.x, top_left.y + centered_offset.y);
+    layout.panel_max = ImVec2(layout.panel_min.x + panel_size, layout.panel_min.y + panel_size);
+    layout.grid_origin =
+        ImVec2(layout.panel_min.x + label_padding + outer_track_padding, layout.panel_min.y + label_padding + outer_track_padding);
+    layout.board_center = ImVec2(layout.panel_min.x + panel_size * 0.5f, layout.panel_min.y + panel_size * 0.5f);
+    layout.grid_step = grid_step;
+    layout.outer_track_padding = outer_track_padding;
+    layout.label_padding = label_padding;
+    layout.board_span = board_span;
+    layout.interaction_radius = layout.grid_step * 0.36f;
+    layout.piece_radius = layout.grid_step * 0.28f;
     return layout;
 }
 
 std::optional<Square> DetectSquare(const BoardLayout& layout, ImVec2 mouse) {
-    const auto local_x = (mouse.x - layout.origin.x) / layout.step;
-    const auto local_y = (mouse.y - layout.origin.y) / layout.step;
+    const auto local_x = (mouse.x - layout.grid_origin.x) / layout.grid_step;
+    const auto local_y = (mouse.y - layout.grid_origin.y) / layout.grid_step;
     const auto x = static_cast<int>(std::lround(local_x));
     const auto y = static_cast<int>(std::lround(local_y));
     if (x < 0 || x >= surakarta::bitboard::kBoardSize || y < 0 || y >= surakarta::bitboard::kBoardSize) {
@@ -177,19 +254,67 @@ void DrawCornerLoops(ImDrawList* draw_list, const BoardLayout& layout, ImU32 col
         BoardPoint(layout, 5, 5),
         BoardPoint(layout, 0, 5),
     };
-    const auto angles = std::array<std::pair<float, float>, 4>{
-        std::pair{0.0f, kPi * 0.5f},
-        std::pair{kPi * 0.5f, kPi},
-        std::pair{kPi, kPi * 1.5f},
-        std::pair{kPi * 1.5f, kPi * 2.0f},
-    };
 
     for (std::size_t i = 0; i < corners.size(); ++i) {
+        const auto spec = CornerLoopForCorner(i);
         for (int radius = 1; radius <= 2; ++radius) {
-            draw_list->PathArcTo(corners[i], layout.step * static_cast<float>(radius), angles[i].first, angles[i].second, 18);
-            draw_list->PathStroke(color, ImDrawFlags_None, thickness);
+            StrokeArc(draw_list,
+                      corners[i],
+                      layout.grid_step * static_cast<float>(radius),
+                      spec.start_angle,
+                      spec.end_angle,
+                      spec.clockwise,
+                      color,
+                      thickness);
         }
     }
+}
+
+bool HasOuterTrackPadding(const BoardLayout& layout) {
+    const auto top_left = BoardPoint(layout, 0, 0);
+    const auto bottom_right = BoardPoint(layout, 5, 5);
+    const float required_padding = layout.grid_step * 2.0f;
+    const float available_left = top_left.x - layout.panel_min.x - layout.label_padding;
+    const float available_top = top_left.y - layout.panel_min.y - layout.label_padding;
+    const float available_right = layout.panel_max.x - bottom_right.x - layout.label_padding;
+    const float available_bottom = layout.panel_max.y - bottom_right.y - layout.label_padding;
+    return available_left >= required_padding &&
+           available_top >= required_padding &&
+           available_right >= required_padding &&
+           available_bottom >= required_padding;
+}
+
+bool UsesOuterCornerLoopSweeps() {
+    constexpr float expected_sweep = kPi * 1.5f;
+    constexpr float tolerance = 0.05f;
+    for (std::size_t i = 0; i < 4; ++i) {
+        const auto spec = CornerLoopForCorner(i);
+        const auto sweep = ResolveArcSweep(spec.start_angle, spec.end_angle, spec.clockwise);
+        if (std::abs(std::abs(sweep.end_radians - sweep.start_radians) - expected_sweep) > tolerance) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int RunBoardGeometrySmoke() {
+    const auto layout = MakeBoardLayout(ImVec2(0.0f, 0.0f), ImVec2(720.0f, 720.0f));
+
+    auto okay = true;
+    if (!HasOuterTrackPadding(layout)) {
+        std::fputs("surakarta-gui geometry smoke failed: board layout lacks padding for the outer track\n", stderr);
+        okay = false;
+    }
+    if (!UsesOuterCornerLoopSweeps()) {
+        std::fputs("surakarta-gui geometry smoke failed: corner loops do not sweep the outer 3/4 circle\n", stderr);
+        okay = false;
+    }
+    if (!okay) {
+        return 1;
+    }
+
+    std::puts("[PASS] surakarta-gui geometry smoke");
+    return 0;
 }
 
 void DrawPathFragments(ImDrawList* draw_list,
@@ -205,25 +330,15 @@ void DrawPathFragments(ImDrawList* draw_list,
             continue;
         }
 
-        float start = AngleToRadians(fragment.info.curve.start_angle);
-        float end = AngleToRadians(fragment.info.curve.end_angle);
-        if (fragment.info.curve.is_clockwise) {
-            if (end > start) {
-                end -= kPi * 2.0f;
-            }
-        } else if (end < start) {
-            end += kPi * 2.0f;
-        }
-
-        const int segments = std::max(12, static_cast<int>(std::abs(end - start) / (kPi * 0.5f) * 18.0f));
         const auto center = BoardPoint(layout, fragment.info.curve.center_x, fragment.info.curve.center_y);
-        draw_list->PathClear();
-        for (int i = 0; i <= segments; ++i) {
-            const float t = start + (end - start) * (static_cast<float>(i) / static_cast<float>(segments));
-            draw_list->PathLineTo(ImVec2(center.x + std::cos(t) * layout.step * static_cast<float>(fragment.info.curve.radius),
-                                         center.y + std::sin(t) * layout.step * static_cast<float>(fragment.info.curve.radius)));
-        }
-        draw_list->PathStroke(color, ImDrawFlags_None, thickness);
+        StrokeArc(draw_list,
+                  center,
+                  layout.grid_step * static_cast<float>(fragment.info.curve.radius),
+                  fragment.info.curve.start_angle,
+                  fragment.info.curve.end_angle,
+                  fragment.info.curve.is_clockwise,
+                  color,
+                  thickness);
     }
 }
 
@@ -231,23 +346,23 @@ void RenderBoard(DevelopmentSession& session,
                  const Palette& palette,
                  const ImVec2& available_size,
                  std::optional<LegalTargetInfo>* hovered_target_info) {
-    const float canvas_size = std::max(320.0f, std::min(available_size.x, available_size.y));
     const auto canvas_pos = ImGui::GetCursorScreenPos();
-    const auto layout = MakeBoardLayout(canvas_pos, canvas_size);
-    ImGui::InvisibleButton("board-canvas", ImVec2(canvas_size, canvas_size));
+    const auto layout = MakeBoardLayout(canvas_pos, available_size);
+    ImGui::InvisibleButton("board-canvas", available_size);
 
     auto* draw_list = ImGui::GetWindowDrawList();
-    draw_list->AddRectFilled(layout.min, layout.max, palette.board_panel, 22.0f);
+    draw_list->AddRectFilled(layout.panel_min, layout.panel_max, palette.board_panel, 22.0f);
+
+    DrawCornerLoops(draw_list, layout, palette.grid, 2.6f);
 
     for (int axis = 0; axis < surakarta::bitboard::kBoardSize; ++axis) {
         draw_list->AddLine(BoardPoint(layout, 0, axis), BoardPoint(layout, 5, axis), palette.grid, 2.0f);
         draw_list->AddLine(BoardPoint(layout, axis, 0), BoardPoint(layout, axis, 5), palette.grid, 2.0f);
     }
-    DrawCornerLoops(draw_list, layout, palette.grid, 2.6f);
 
     for (int y = 0; y < surakarta::bitboard::kBoardSize; ++y) {
         for (int x = 0; x < surakarta::bitboard::kBoardSize; ++x) {
-            draw_list->AddCircleFilled(BoardPoint(layout, x, y), layout.step * 0.06f, palette.point);
+            draw_list->AddCircleFilled(BoardPoint(layout, x, y), layout.grid_step * 0.06f, palette.point);
         }
     }
 
@@ -321,8 +436,16 @@ void RenderBoard(DevelopmentSession& session,
     for (int index = 0; index < surakarta::bitboard::kBoardSize; ++index) {
         const auto top = BoardPoint(layout, index, 0);
         const auto left = BoardPoint(layout, 0, index);
-        draw_list->AddText(ImVec2(top.x - 4.0f, layout.min.y + 10.0f), palette.grid, std::to_string(index).c_str());
-        draw_list->AddText(ImVec2(layout.min.x + 10.0f, left.y - 7.0f), palette.grid, std::to_string(index).c_str());
+        const auto top_text = std::to_string(index);
+        const auto left_text = std::to_string(index);
+        const auto top_text_size = ImGui::CalcTextSize(top_text.c_str());
+        const auto left_text_size = ImGui::CalcTextSize(left_text.c_str());
+        const float top_label_y =
+            layout.grid_origin.y - layout.outer_track_padding - top_text_size.y - layout.label_padding * 0.15f;
+        const float left_label_x =
+            layout.grid_origin.x - layout.outer_track_padding - left_text_size.x - layout.label_padding * 0.15f;
+        draw_list->AddText(ImVec2(top.x - top_text_size.x * 0.5f, top_label_y), palette.grid, top_text.c_str());
+        draw_list->AddText(ImVec2(left_label_x, left.y - left_text_size.y * 0.5f), palette.grid, left_text.c_str());
     }
 }
 
@@ -445,6 +568,8 @@ StartupOptions ParseArgs(int argc, char** argv) {
             options.smoke_test = true;
         } else if (arg == "--smoke-test-init") {
             options.smoke_test_init = true;
+        } else if (arg == "--smoke-test-geometry") {
+            options.smoke_test_geometry = true;
         } else if ((arg == "--file" || arg == "-f") && i + 1 < argc) {
             options.file_name = argv[++i];
         } else if ((arg == "--depth" || arg == "-d") && i + 1 < argc) {
@@ -536,6 +661,9 @@ int main(int argc, char** argv) {
     if (options.smoke_test_init) {
         return RunGuiInitializationSmoke();
     }
+    if (options.smoke_test_geometry) {
+        return RunBoardGeometrySmoke();
+    }
 
     auto session = DevelopmentSession{};
     auto sidebar = SidebarState{};
@@ -609,8 +737,11 @@ int main(int argc, char** argv) {
         ImGui::Begin("Surakarta Validator", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize);
 
         const auto content = ImGui::GetContentRegionAvail();
-        const float board_width = content.x * 0.66f;
-        const auto sidebar_width = content.x - board_width - 12.0f;
+        constexpr float kPaneGap = 12.0f;
+        constexpr float kMinSidebarWidth = 180.0f;
+        const float max_sidebar_width = std::max(kMinSidebarWidth, content.x - 280.0f - kPaneGap);
+        const float sidebar_width = std::clamp(content.x * 0.26f, kMinSidebarWidth, max_sidebar_width);
+        const float board_width = std::max(0.0f, content.x - sidebar_width - kPaneGap);
         auto hovered_target_info = std::optional<LegalTargetInfo>{};
 
         ImGui::BeginChild("board-pane", ImVec2(board_width, content.y), true);
