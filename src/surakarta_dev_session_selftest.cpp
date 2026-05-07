@@ -15,6 +15,7 @@ using namespace std::chrono_literals;
 using surakarta::bitboard::Color;
 using surakarta::bitboard::DescribeLegalTargets;
 using surakarta::bitboard::MakeSquare;
+using surakarta::bitboard::PositionAdapter;
 using surakarta::bitboard::SearchLimits;
 using surakarta::bitboard::SearchSnapshot;
 using surakarta::devtools::DevelopmentSession;
@@ -120,6 +121,69 @@ bool SnapshotHasProgress(const SearchSnapshot& snapshot) {
 
 bool MovesEqual(const surakarta::bitboard::Move& lhs, const surakarta::bitboard::Move& rhs) {
     return lhs.from == rhs.from && lhs.to == rhs.to && lhs.flags == rhs.flags && lhs.aux == rhs.aux;
+}
+
+bool PositionsEqual(const surakarta::bitboard::Position& lhs, const surakarta::bitboard::Position& rhs) {
+    return lhs.board.pieces[0] == rhs.board.pieces[0] &&
+           lhs.board.pieces[1] == rhs.board.pieces[1] &&
+           lhs.side_to_move == rhs.side_to_move &&
+           lhs.ply == rhs.ply &&
+           lhs.no_capture_ply == rhs.no_capture_ply &&
+           lhs.max_no_capture_round == rhs.max_no_capture_round &&
+           lhs.zobrist_key == rhs.zobrist_key &&
+           lhs.eval_cache == rhs.eval_cache;
+}
+
+bool HasCurveFragment(const std::vector<SurakartaMovePathFragment>& path) {
+    for (const auto& fragment : path) {
+        if (fragment.is_curve) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string ScreenshotSameFileCaptureGoldenFile() {
+    return std::string(BITBOARD_TEST_DATA_DIR) + "\\screenshot_2026_05_06_same_file_capture.txt";
+}
+
+bool TestCoordinateConventionIsFileThenRank() {
+    const auto square = MakeSquare(2, 3);
+    const auto legacy = PositionAdapter::ToLegacyPosition(square);
+    auto okay = true;
+    okay &= Expect(legacy.x == 2 && legacy.y == 3,
+                   "engine text coordinates should be printed as GUI x,y coordinates");
+    okay &= Expect(PositionAdapter::FromLegacyPosition(SurakartaPosition(2, 3)) == square,
+                   "GUI x,y coordinates should round-trip through the bitboard adapter");
+    return okay;
+}
+
+bool TestScreenshotRejectedCandidatesAreNotSelectableCaptures() {
+    auto session = DevelopmentSession{};
+    std::string error;
+
+    auto okay = true;
+    okay &= Expect(session.LoadFromFile(ScreenshotSameFileCaptureGoldenFile(), &error), error);
+    okay &= Expect(!session.SelectSquare(MakeSquare(2, 3)),
+                   "screenshot engine-text source (2,3) should not be selectable because the GUI square is empty");
+    okay &= Expect(!session.SelectSquare(MakeSquare(2, 4)),
+                   "screenshot GUI-observed source (2,4) should not be selectable because the GUI square is empty");
+    return okay;
+}
+
+bool TestAppliedCaptureKeepsVisibleLastMovePath() {
+    auto session = DevelopmentSession{};
+    std::string error;
+
+    auto okay = true;
+    okay &= Expect(session.LoadFromFile(std::string(BITBOARD_TEST_DATA_DIR) + "\\game9.txt", &error), error);
+    okay &= Expect(session.SelectSquare(MakeSquare(3, 3)), "expected to select capture source square");
+    okay &= Expect(session.ApplyHumanMove(MakeSquare(3, 1)), "expected to apply same-file capture");
+    okay &= Expect(session.LastMove().has_value(), "applied capture should be recorded as last move");
+    okay &= Expect(!session.LastMovePath().empty(), "applied capture should keep a visible path");
+    okay &= Expect(HasCurveFragment(session.LastMovePath()),
+                   "same-file capture path should show the loop instead of looking like a direct jump");
+    return okay;
 }
 
 bool TestLiveSnapshotCarriesPrincipalVariationAndCounters() {
@@ -259,6 +323,85 @@ bool TestSnapshotClearsAfterSearchCancellation() {
     return okay;
 }
 
+bool TestUndoRestoresPreviousHumanTurnAfterEngineReply() {
+    auto session = DevelopmentSession{};
+    auto limits = SearchLimits{};
+    limits.max_depth = 1;
+    limits.threads = 1;
+    session.SetSearchLimits(limits);
+    session.SetHumanColor(Color::Black);
+
+    const auto before_human_move = session.Position();
+
+    auto okay = true;
+    okay &= Expect(session.SelectSquare(MakeSquare(0, 1)), "expected to select black piece before undo test");
+    okay &= Expect(session.ApplyHumanMove(MakeSquare(0, 2)), "expected to apply opening move before undo test");
+    okay &= Expect(session.WaitForIdle(5s), "engine reply should finish before undo");
+    okay &= Expect(session.Position().SideToMove() == Color::Black, "undo test should return to human turn");
+    okay &= Expect(session.CanUndo(), "undo should be available on the next human turn");
+    okay &= Expect(session.UndoHumanTurn(), "undo should restore the previous human turn");
+    okay &= Expect(PositionsEqual(session.Position(), before_human_move),
+                   "undo should restore the exact pre-human-move position");
+    okay &= Expect(session.Position().SideToMove() == Color::Black, "undo should leave black to move");
+    okay &= Expect(!session.SearchActive(), "undo should leave the engine idle");
+    okay &= Expect(!session.CanUndo(), "single undo should consume the only snapshot");
+    return okay;
+}
+
+bool TestUndoIsBlockedDuringEngineSearch() {
+    auto session = DevelopmentSession{};
+    auto limits = SearchLimits{};
+    limits.max_depth = 8;
+    limits.threads = 1;
+    session.SetSearchLimits(limits);
+    session.SetHumanColor(Color::Black);
+
+    auto okay = true;
+    okay &= Expect(session.SelectSquare(MakeSquare(0, 1)), "expected to select black piece before active-search undo test");
+    okay &= Expect(session.ApplyHumanMove(MakeSquare(0, 2)), "expected to start engine search before active-search undo test");
+    okay &= Expect(session.SearchActive(), "engine should be active before active-search undo test");
+    okay &= Expect(!session.CanUndo(), "undo should be disabled while engine is searching");
+    okay &= Expect(!session.UndoHumanTurn(), "undo call should fail while engine is searching");
+    okay &= Expect(session.Position().SideToMove() == Color::White,
+                   "failed undo during search should not change side to move");
+    okay &= Expect(session.WaitForIdle(5s), "engine search should still finish after blocked undo");
+    return okay;
+}
+
+bool TestUndoHistoryClearsAcrossSessionIdentityChanges() {
+    auto session = DevelopmentSession{};
+    auto limits = SearchLimits{};
+    limits.max_depth = 1;
+    limits.threads = 1;
+    session.SetSearchLimits(limits);
+    session.SetHumanColor(Color::Black);
+
+    auto okay = true;
+    okay &= Expect(session.SelectSquare(MakeSquare(0, 1)), "expected to select black piece before reset undo clear test");
+    okay &= Expect(session.ApplyHumanMove(MakeSquare(0, 2)), "expected to apply opening move before reset undo clear test");
+    okay &= Expect(session.WaitForIdle(5s), "engine reply should finish before reset undo clear test");
+    okay &= Expect(session.CanUndo(), "undo should be available before reset");
+    session.Reset();
+    okay &= Expect(!session.CanUndo(), "reset should clear undo history");
+
+    okay &= Expect(session.SelectSquare(MakeSquare(0, 1)), "expected to select black piece before load undo clear test");
+    okay &= Expect(session.ApplyHumanMove(MakeSquare(0, 2)), "expected to apply opening move before load undo clear test");
+    okay &= Expect(session.WaitForIdle(5s), "engine reply should finish before load undo clear test");
+    okay &= Expect(session.CanUndo(), "undo should be available before load");
+    std::string error;
+    okay &= Expect(session.LoadFromFile(std::string(BITBOARD_TEST_DATA_DIR) + "\\game1.txt", &error), error);
+    okay &= Expect(!session.CanUndo(), "loading a position should clear undo history");
+
+    session.Reset();
+    okay &= Expect(session.SelectSquare(MakeSquare(0, 1)), "expected to select black piece before side undo clear test");
+    okay &= Expect(session.ApplyHumanMove(MakeSquare(0, 2)), "expected to apply opening move before side undo clear test");
+    okay &= Expect(session.WaitForIdle(5s), "engine reply should finish before side undo clear test");
+    okay &= Expect(session.CanUndo(), "undo should be available before human side change");
+    session.SetHumanColor(Color::White);
+    okay &= Expect(!session.CanUndo(), "changing human side should clear undo history");
+    return okay;
+}
+
 bool TestTerminalStatusUsesSharedRuleEvaluation() {
     auto session = DevelopmentSession{};
     std::string error;
@@ -280,10 +423,16 @@ bool TestTerminalStatusUsesSharedRuleEvaluation() {
 
 int main() {
     bool okay = true;
+    okay &= TestCoordinateConventionIsFileThenRank();
     okay &= TestSelectionMatchesBitboardTargets();
     okay &= TestHoverPathForCaptureTarget();
+    okay &= TestScreenshotRejectedCandidatesAreNotSelectableCaptures();
     okay &= TestEngineRepliesAfterHumanMove();
+    okay &= TestUndoRestoresPreviousHumanTurnAfterEngineReply();
+    okay &= TestUndoIsBlockedDuringEngineSearch();
+    okay &= TestUndoHistoryClearsAcrossSessionIdentityChanges();
     okay &= TestChangingHumanSideCancelsSearch();
+    okay &= TestAppliedCaptureKeepsVisibleLastMovePath();
     okay &= TestLiveSnapshotCarriesPrincipalVariationAndCounters();
     okay &= TestSnapshotClearsAfterSearchCancellation();
     okay &= TestTerminalStatusUsesSharedRuleEvaluation();

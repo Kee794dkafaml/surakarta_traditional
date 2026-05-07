@@ -111,6 +111,9 @@ struct SearchController::SharedSearchState {
     std::atomic<std::uint64_t> thread_spawn_count{0};
     mutable std::mutex best_mutex;
     SearchResult best_result{};
+    mutable std::mutex diagnostics_mutex;
+    SearchDiagnostics diagnostics{};
+    std::atomic<int> diagnostic_attempt{0};
 
     bool TryVisitNode() {
         if (limits.node_limit == 0) {
@@ -160,6 +163,51 @@ struct SearchController::SharedSearchState {
         if (IsSearchResultPreferred(candidate, best_result)) {
             best_result = candidate;
         }
+    }
+
+    bool DiagnosticsEnabled() const {
+        return limits.enable_diagnostics;
+    }
+
+    int RecordRootMoveDiagnostic(const SearchRootMoveDiagnostic& diagnostic) {
+        if (!DiagnosticsEnabled()) {
+            return -1;
+        }
+        std::lock_guard<std::mutex> lock(diagnostics_mutex);
+        diagnostics.root_moves.push_back(diagnostic);
+        return static_cast<int>(diagnostics.root_moves.size()) - 1;
+    }
+
+    void RecordRootBestUpdate(int diagnostic_event_id) {
+        if (!DiagnosticsEnabled() || diagnostic_event_id < 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(diagnostics_mutex);
+        const auto index = static_cast<std::size_t>(diagnostic_event_id);
+        if (index < diagnostics.root_moves.size()) {
+            ++diagnostics.root_moves[index].root_best_updates;
+        }
+    }
+
+    void RecordAspirationDiagnostic(const SearchAspirationDiagnostic& diagnostic) {
+        if (!DiagnosticsEnabled()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(diagnostics_mutex);
+        diagnostics.aspiration_attempts.push_back(diagnostic);
+    }
+
+    void RecordQsearchDiagnostic(const SearchQsearchDiagnostic& diagnostic) {
+        if (!DiagnosticsEnabled() || diagnostic.qnodes == 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(diagnostics_mutex);
+        diagnostics.qsearch_sources.push_back(diagnostic);
+    }
+
+    SearchDiagnostics Diagnostics() const {
+        std::lock_guard<std::mutex> lock(diagnostics_mutex);
+        return diagnostics;
     }
 
     SearchSnapshot Snapshot(bool active) const {
@@ -215,7 +263,8 @@ constexpr int kTupleSentinel = -1;
 constexpr int kHistoryMax = 32'000;
 constexpr std::uint64_t kNodeBatchSize = 128;
 constexpr double kTrainingWeightClamp = 4096.0;
-constexpr int kTrainingTerminalScore = 1200;
+constexpr double kTrainingTerminalRewardDefault = 1200.0;
+constexpr int kTrainingMaxPlies = 256;
 
 bool IsMateLikeScore(int score) {
     return std::abs(score) >= (kMateScore - kMaxPly - 1);
@@ -232,9 +281,12 @@ struct RootSearchResult {
     TTBound bound{TTBound::None};
     std::array<Move, kMaxPly> pv{};
     int pv_length{0};
+    int move_index{-1};
+    int diagnostic_event_id{-1};
 };
 
 int TotalWeightCount();
+Color WinnerColorFromPosition(const Position& position);
 
 Color OppositeColor(Color color) {
     return color == Color::Black ? Color::White : Color::Black;
@@ -417,18 +469,21 @@ std::int32_t QuantizeWeight(double value) {
     return static_cast<std::int32_t>(std::llround(std::clamp(value, -kTrainingWeightClamp, kTrainingWeightClamp)));
 }
 
-double TrainingTargetFromAfterMove(const Position& position_after_move) {
+double TrainingTargetFromAfterMove(const Position& position_after_move,
+                                   const TrainingStepContext& context,
+                                   double terminal_reward) {
     const auto mover = OppositeColor(position_after_move.SideToMove());
     const auto enemy = position_after_move.SideToMove();
     if (position_after_move.board.Count(enemy) == 0) {
-        return kTrainingTerminalScore;
+        return TrainingTerminalTarget(mover, mover, terminal_reward);
     }
     if (position_after_move.board.Count(mover) == 0) {
-        return -kTrainingTerminalScore;
+        return TrainingTerminalTarget(enemy, mover, terminal_reward);
     }
-    if (position_after_move.no_capture_ply >= position_after_move.max_no_capture_round) {
-        const int material = MaterialBalance(position_after_move);
-        return mover == Color::Black ? static_cast<double>(material) : static_cast<double>(-material);
+    if (position_after_move.no_capture_ply >= position_after_move.max_no_capture_round ||
+        !context.next_has_legal_moves ||
+        context.next_is_ply_cap) {
+        return TrainingTerminalTarget(WinnerColorFromPosition(position_after_move), mover, terminal_reward);
     }
     return std::numeric_limits<double>::quiet_NaN();
 }
@@ -560,6 +615,10 @@ struct WorkerContext {
     std::array<std::array<Move, 2>, kMaxPly + 2> killer{};
     std::uint64_t pending_nodes{0};
     std::uint64_t pending_qnodes{0};
+    int diagnostic_root_move_index{-1};
+    Move diagnostic_root_move{};
+    std::uint64_t diagnostic_qsearch_entries{0};
+    std::uint64_t diagnostic_qsearch_capture_moves{0};
 
     explicit WorkerContext(SearchController& controller_ref,
                            SearchController::SharedSearchState& shared_ref,
@@ -603,6 +662,23 @@ struct WorkerContext {
             shared.qnodes.fetch_add(pending_qnodes, std::memory_order_relaxed);
             pending_qnodes = 0;
         }
+    }
+
+    std::uint64_t ObservedNodes() const {
+        return shared.nodes.load(std::memory_order_relaxed) + pending_nodes;
+    }
+
+    std::uint64_t ObservedQNodes() const {
+        return shared.qnodes.load(std::memory_order_relaxed) + pending_qnodes;
+    }
+
+    SearchDiagnosticLine BuildDiagnosticLine(int ply) const {
+        auto line = SearchDiagnosticLine{};
+        line.length = std::clamp(ply, 0, kMaxPly);
+        for (int i = 0; i < line.length; ++i) {
+            line.moves[i] = stack[i + 1].current_move;
+        }
+        return line;
     }
 
     int Evaluate(const Position& position) const {
@@ -720,6 +796,9 @@ struct WorkerContext {
 
         auto move_list = MoveList{};
         GenerateMoves(position, move_list, true);
+        if (shared.DiagnosticsEnabled()) {
+            diagnostic_qsearch_capture_moves += static_cast<std::uint64_t>(move_list.size);
+        }
         ScoreMoves(move_list, Move{}, Move{}, ply);
         SortMoves(move_list);
 
@@ -762,7 +841,29 @@ struct WorkerContext {
         }
         if (depth <= 0) {
             stack[ply].pv_length = 0;
-            return Quiescence(position, alpha, beta, ply);
+            if (!shared.DiagnosticsEnabled()) {
+                return Quiescence(position, alpha, beta, ply);
+            }
+
+            const auto qnodes_before = ObservedQNodes();
+            const auto capture_moves_before = diagnostic_qsearch_capture_moves;
+            ++diagnostic_qsearch_entries;
+            const auto line = BuildDiagnosticLine(ply);
+            const int score = Quiescence(position, alpha, beta, ply);
+            const auto qnodes_after = ObservedQNodes();
+
+            auto diagnostic = SearchQsearchDiagnostic{};
+            diagnostic.depth = shared.current_depth.load(std::memory_order_relaxed);
+            diagnostic.attempt = shared.diagnostic_attempt.load(std::memory_order_relaxed);
+            diagnostic.root_move_index = diagnostic_root_move_index;
+            diagnostic.root_move = diagnostic_root_move;
+            diagnostic.ply = ply;
+            diagnostic.score = score;
+            diagnostic.qnodes = qnodes_after - qnodes_before;
+            diagnostic.capture_moves = diagnostic_qsearch_capture_moves - capture_moves_before;
+            diagnostic.line = line;
+            shared.RecordQsearchDiagnostic(diagnostic);
+            return score;
         }
 
         const int original_alpha = alpha;
@@ -884,15 +985,27 @@ struct WorkerContext {
         return best_score;
     }
 
-    RootSearchResult SearchRootMove(const Position& root, Move move, int depth, int alpha, int beta) {
+    RootSearchResult SearchRootMove(const Position& root, Move move, int move_index, int depth, int alpha, int beta) {
         auto result = RootSearchResult{};
         result.best_move = move;
         result.bound = TTBound::Exact;
         result.pv[0] = move;
         result.pv_length = 1;
+        result.move_index = move_index;
 
         const int original_alpha = alpha;
         const int original_beta = beta;
+        const auto previous_root_move_index = diagnostic_root_move_index;
+        const auto previous_root_move = diagnostic_root_move;
+        diagnostic_root_move_index = move_index;
+        diagnostic_root_move = move;
+        const auto nodes_before = ObservedNodes();
+        const auto qnodes_before = ObservedQNodes();
+        const auto tt_hits_before = shared.tt_hits.load(std::memory_order_relaxed);
+        const auto beta_cutoffs_before = shared.beta_cutoffs.load(std::memory_order_relaxed);
+        const auto qsearch_entries_before = diagnostic_qsearch_entries;
+        const auto qsearch_capture_moves_before = diagnostic_qsearch_capture_moves;
+
         auto working = root;
         Undo undo;
         MakeMove(working, move, undo);
@@ -913,6 +1026,34 @@ struct WorkerContext {
             result.pv[i + 1] = stack[1].pv[i];
         }
         result.pv_length = std::min(kMaxPly, child_pv_length + 1);
+        if (shared.DiagnosticsEnabled()) {
+            auto diagnostic = SearchRootMoveDiagnostic{};
+            diagnostic.depth = shared.current_depth.load(std::memory_order_relaxed);
+            diagnostic.attempt = shared.diagnostic_attempt.load(std::memory_order_relaxed);
+            diagnostic.move_index = move_index;
+            diagnostic.move = move;
+            diagnostic.alpha = original_alpha;
+            diagnostic.beta = original_beta;
+            diagnostic.score = score;
+            diagnostic.bound = static_cast<int>(result.bound);
+            diagnostic.nodes = ObservedNodes() - nodes_before;
+            diagnostic.qnodes = ObservedQNodes() - qnodes_before;
+            diagnostic.fail_highs = result.bound == TTBound::Lower ? 1 : 0;
+            diagnostic.fail_lows = result.bound == TTBound::Upper ? 1 : 0;
+            diagnostic.tt_hits = shared.tt_hits.load(std::memory_order_relaxed) - tt_hits_before;
+            diagnostic.beta_cutoffs =
+                shared.beta_cutoffs.load(std::memory_order_relaxed) - beta_cutoffs_before;
+            diagnostic.qsearch_entries = diagnostic_qsearch_entries - qsearch_entries_before;
+            diagnostic.qsearch_capture_moves =
+                diagnostic_qsearch_capture_moves - qsearch_capture_moves_before;
+            diagnostic.pv.length = ClampPvLength(result.pv_length);
+            for (int i = 0; i < diagnostic.pv.length; ++i) {
+                diagnostic.pv.moves[i] = result.pv[i];
+            }
+            result.diagnostic_event_id = shared.RecordRootMoveDiagnostic(diagnostic);
+        }
+        diagnostic_root_move_index = previous_root_move_index;
+        diagnostic_root_move = previous_root_move;
         return result;
     }
 };
@@ -964,6 +1105,7 @@ void MaybeUpdateRootBest(RootSearchTask& task,
     }
 
     shared.root_best_updates.fetch_add(1, std::memory_order_relaxed);
+    shared.RecordRootBestUpdate(candidate.diagnostic_event_id);
     const auto previous_alpha = task.shared_alpha.load(std::memory_order_relaxed);
     if (published.score > previous_alpha) {
         AtomicMax(task.shared_alpha, published.score);
@@ -1006,6 +1148,7 @@ void ConsumeRootQueue(WorkerContext& context,
     while (TryAcquireRootTask(task, shared, &ticket)) {
         const auto candidate = context.SearchRootMove(task.root,
                                                       task.root_moves.moves[ticket.index],
+                                                      ticket.index,
                                                       task.depth,
                                                       ticket.alpha,
                                                       ticket.beta);
@@ -1146,7 +1289,7 @@ SearchResult SearchDepthAttempt(SearchController& controller,
     task.shared_alpha.store(alpha, std::memory_order_relaxed);
     task.shared_beta.store(beta, std::memory_order_relaxed);
 
-    const auto first_candidate = main_context.SearchRootMove(root, root_moves.moves[0], depth, alpha, beta);
+    const auto first_candidate = main_context.SearchRootMove(root, root_moves.moves[0], 0, depth, alpha, beta);
     MaybeUpdateRootBest(task, shared, first_candidate);
 
     if (!shared.stop.load(std::memory_order_relaxed) &&
@@ -1379,6 +1522,103 @@ void NTupleWeights::EnumerateActiveWeightIndices(const Position& position, std::
     }
 }
 
+double EvaluateTrainingValueForSideToMove(const NTupleWeights& weights, const Position& position) {
+    return EvaluateWeightsForSideToMove(weights, position);
+}
+
+double TrainingTerminalTarget(Color winner, Color side_to_update, double terminal_reward) {
+    if (winner == Color::None) {
+        return 0.0;
+    }
+    return winner == side_to_update ? terminal_reward : -terminal_reward;
+}
+
+Position BuildNearTerminalTrainingPosition(int sample_index) {
+    const auto mover = (sample_index & 1) == 0 ? Color::Black : Color::White;
+    const auto enemy = mover == Color::Black ? Color::White : Color::Black;
+
+    auto position = Position{};
+    position.board.SetPiece(mover, MakeSquare(5, 1));
+    position.board.SetPiece(enemy, MakeSquare(1, 1));
+    position.side_to_move = static_cast<std::uint8_t>(mover);
+    position.no_capture_ply = 0;
+    position.ply = 0;
+    position.max_no_capture_round = MAX_NO_CAPTURE_ROUND;
+    position.eval_cache = MaterialBalance(position);
+    position.zobrist_key = ComputeZobrist(position);
+    return position;
+}
+
+void ResetTrainingTraces(std::vector<double>& traces) {
+    std::fill(traces.begin(), traces.end(), 0.0);
+}
+
+bool ApplyTrainingStep(NTupleWeights& weights,
+                       std::vector<double>& traces,
+                       const Position& current,
+                       const Position& next,
+                       const TrainingStepContext& context,
+                       double alpha,
+                       double lambda,
+                       TrainingStepResult* result,
+                       double terminal_reward,
+                       double td_error_clip) {
+    if (traces.size() != weights.values.size()) {
+        return false;
+    }
+
+    auto active_indices = std::vector<int>{};
+    weights.EnumerateActiveWeightIndices(current, active_indices);
+    const auto current_value = EvaluateTrainingValueForSideToMove(weights, current);
+
+    auto target_value = TrainingTargetFromAfterMove(next, context, terminal_reward);
+    const auto terminal_target = !std::isnan(target_value);
+    if (!terminal_target) {
+        target_value = -EvaluateTrainingValueForSideToMove(weights, next);
+    }
+
+    for (auto& trace : traces) {
+        trace *= -lambda;
+    }
+    const auto feature_sign = current.SideToMove() == Color::Black ? 1.0 : -1.0;
+    for (const auto index : active_indices) {
+        const auto trace_index = static_cast<std::size_t>(index);
+        if (trace_index >= traces.size()) {
+            return false;
+        }
+        traces[trace_index] += feature_sign;
+    }
+
+    const auto raw_delta = target_value - current_value;
+    const auto delta = td_error_clip > 0.0
+                           ? std::clamp(raw_delta, -td_error_clip, td_error_clip)
+                           : raw_delta;
+    auto step_abs_weight_delta = 0.0;
+    auto changed_weight_count = std::uint64_t{0};
+    for (std::size_t i = 0; i < weights.values.size(); ++i) {
+        if (traces[i] == 0.0) {
+            continue;
+        }
+        const auto change = alpha * delta * traces[i];
+        if (change == 0.0) {
+            continue;
+        }
+        weights.values[i] = std::clamp(weights.values[i] + change, -kTrainingWeightClamp, kTrainingWeightClamp);
+        step_abs_weight_delta += std::abs(change);
+        ++changed_weight_count;
+    }
+
+    if (result != nullptr) {
+        result->current_value = current_value;
+        result->target_value = target_value;
+        result->td_error = delta;
+        result->abs_weight_delta = step_abs_weight_delta;
+        result->changed_weight_count = changed_weight_count;
+        result->terminal_target = terminal_target;
+    }
+    return true;
+}
+
 NTupleEvaluator::NTupleEvaluator()
     : header_(DefaultWeightHeader()),
       weights_(std::make_unique<int[]>(header_.weight_count)) {
@@ -1533,7 +1773,13 @@ SearchResult SearchController::Search(const Position& root, const SearchLimits& 
             }
 
             auto depth_result = SearchResult{};
+            int attempt = 0;
             while (true) {
+                ++attempt;
+                shared->diagnostic_attempt.store(attempt, std::memory_order_relaxed);
+                const auto attempt_nodes_before = shared->nodes.load(std::memory_order_relaxed) + main_context.pending_nodes;
+                const auto attempt_qnodes_before = shared->qnodes.load(std::memory_order_relaxed) + main_context.pending_qnodes;
+                const auto attempt_root_updates_before = shared->root_best_updates.load(std::memory_order_relaxed);
                 shared->aspiration_attempts.fetch_add(1, std::memory_order_relaxed);
                 depth_result = SearchDepthAttempt(*this,
                                                   root,
@@ -1544,10 +1790,37 @@ SearchResult SearchController::Search(const Position& root, const SearchLimits& 
                                                   alpha,
                                                   beta,
                                                   result.best_move);
+                main_context.FlushCounters();
+                const auto attempt_nodes_after = shared->nodes.load(std::memory_order_relaxed);
+                const auto attempt_qnodes_after = shared->qnodes.load(std::memory_order_relaxed);
+                const auto attempt_root_updates_after = shared->root_best_updates.load(std::memory_order_relaxed);
                 if (shared->stop.load(std::memory_order_relaxed)) {
+                    auto diagnostic = SearchAspirationDiagnostic{};
+                    diagnostic.depth = depth;
+                    diagnostic.attempt = attempt;
+                    diagnostic.alpha = alpha;
+                    diagnostic.beta = beta;
+                    diagnostic.score = depth_result.score;
+                    diagnostic.outcome = "stopped";
+                    diagnostic.nodes = attempt_nodes_after - attempt_nodes_before;
+                    diagnostic.qnodes = attempt_qnodes_after - attempt_qnodes_before;
+                    diagnostic.root_best_updates = attempt_root_updates_after - attempt_root_updates_before;
+                    shared->RecordAspirationDiagnostic(diagnostic);
                     break;
                 }
                 if (depth_result.score <= alpha) {
+                    auto diagnostic = SearchAspirationDiagnostic{};
+                    diagnostic.depth = depth;
+                    diagnostic.attempt = attempt;
+                    diagnostic.alpha = alpha;
+                    diagnostic.beta = beta;
+                    diagnostic.score = depth_result.score;
+                    diagnostic.outcome = "fail_low";
+                    diagnostic.nodes = attempt_nodes_after - attempt_nodes_before;
+                    diagnostic.qnodes = attempt_qnodes_after - attempt_qnodes_before;
+                    diagnostic.root_best_updates = attempt_root_updates_after - attempt_root_updates_before;
+                    diagnostic.fail_lows = 1;
+                    shared->RecordAspirationDiagnostic(diagnostic);
                     shared->fail_lows.fetch_add(1, std::memory_order_relaxed);
                     shared->aspiration_retries.fetch_add(1, std::memory_order_relaxed);
                     if (!full_window_mode && IsMateLikeScore(depth_result.score)) {
@@ -1563,6 +1836,18 @@ SearchResult SearchController::Search(const Position& root, const SearchLimits& 
                     continue;
                 }
                 if (depth_result.score >= beta) {
+                    auto diagnostic = SearchAspirationDiagnostic{};
+                    diagnostic.depth = depth;
+                    diagnostic.attempt = attempt;
+                    diagnostic.alpha = alpha;
+                    diagnostic.beta = beta;
+                    diagnostic.score = depth_result.score;
+                    diagnostic.outcome = "fail_high";
+                    diagnostic.nodes = attempt_nodes_after - attempt_nodes_before;
+                    diagnostic.qnodes = attempt_qnodes_after - attempt_qnodes_before;
+                    diagnostic.root_best_updates = attempt_root_updates_after - attempt_root_updates_before;
+                    diagnostic.fail_highs = 1;
+                    shared->RecordAspirationDiagnostic(diagnostic);
                     shared->fail_highs.fetch_add(1, std::memory_order_relaxed);
                     shared->aspiration_retries.fetch_add(1, std::memory_order_relaxed);
                     if (!full_window_mode && IsMateLikeScore(depth_result.score)) {
@@ -1577,6 +1862,17 @@ SearchResult SearchController::Search(const Position& root, const SearchLimits& 
                     }
                     continue;
                 }
+                auto diagnostic = SearchAspirationDiagnostic{};
+                diagnostic.depth = depth;
+                diagnostic.attempt = attempt;
+                diagnostic.alpha = alpha;
+                diagnostic.beta = beta;
+                diagnostic.score = depth_result.score;
+                diagnostic.outcome = "exact";
+                diagnostic.nodes = attempt_nodes_after - attempt_nodes_before;
+                diagnostic.qnodes = attempt_qnodes_after - attempt_qnodes_before;
+                diagnostic.root_best_updates = attempt_root_updates_after - attempt_root_updates_before;
+                shared->RecordAspirationDiagnostic(diagnostic);
                 break;
             }
 
@@ -1588,6 +1884,7 @@ SearchResult SearchController::Search(const Position& root, const SearchLimits& 
         }
 
         result.stats = shared->Stats();
+        result.diagnostics = shared->Diagnostics();
         auto snapshot = shared->Snapshot(false);
         snapshot.active = false;
         finalize(snapshot);
@@ -1732,6 +2029,53 @@ void AccumulateOutcome(Color winner, TrainingSummary& summary) {
     }
 }
 
+void AccumulateCheckmateTerminal(Color winner, TrainingSummary& summary) {
+    AccumulateOutcome(winner, summary);
+    ++summary.terminal_checkmate;
+}
+
+void AccumulateNoCaptureTerminal(Color winner, TrainingSummary& summary) {
+    AccumulateOutcome(winner, summary);
+    ++summary.terminal_no_capture_limit;
+}
+
+void AccumulateNoLegalMoveTerminal(Color winner, TrainingSummary& summary) {
+    AccumulateOutcome(winner, summary);
+    ++summary.terminal_no_legal_move;
+}
+
+void AccumulatePlyCapTerminal(Color winner, TrainingSummary& summary) {
+    AccumulateOutcome(winner, summary);
+    ++summary.terminal_ply_cap;
+}
+
+TrainingCheckpointSummary BuildTrainingCheckpointSummary(const TrainingSummary& summary,
+                                                         const std::string& checkpoint_path,
+                                                         double total_abs_td_error,
+                                                         double total_abs_weight_delta) {
+    auto checkpoint = TrainingCheckpointSummary{};
+    checkpoint.games_completed = summary.games_completed;
+    checkpoint.path = checkpoint_path;
+    checkpoint.black_wins = summary.black_wins;
+    checkpoint.white_wins = summary.white_wins;
+    checkpoint.draws = summary.draws;
+    checkpoint.terminal_checkmate = summary.terminal_checkmate;
+    checkpoint.terminal_no_capture_limit = summary.terminal_no_capture_limit;
+    checkpoint.terminal_no_legal_move = summary.terminal_no_legal_move;
+    checkpoint.terminal_ply_cap = summary.terminal_ply_cap;
+    checkpoint.positions_evaluated = summary.positions_evaluated;
+    checkpoint.update_count = summary.update_count;
+    checkpoint.max_abs_td_error = summary.max_abs_td_error;
+    checkpoint.max_abs_weight_delta = summary.max_abs_weight_delta;
+    if (summary.update_count > 0) {
+        checkpoint.average_abs_td_error =
+            total_abs_td_error / static_cast<double>(summary.update_count);
+        checkpoint.average_abs_weight_delta =
+            total_abs_weight_delta / static_cast<double>(summary.update_count);
+    }
+    return checkpoint;
+}
+
 std::filesystem::path CurrentExecutablePath() {
 #ifdef _WIN32
     std::array<char, MAX_PATH> buffer{};
@@ -1857,6 +2201,22 @@ bool RunBitboardTraining(const TrainingOptions& options,
         SetErrorMessage(error_message, "game count must be non-negative");
         return false;
     }
+    if (options.terminal_reward <= 0.0) {
+        SetErrorMessage(error_message, "terminal reward must be positive");
+        return false;
+    }
+    if (options.td_error_clip < 0.0) {
+        SetErrorMessage(error_message, "td error clip must be non-negative");
+        return false;
+    }
+    if (options.terminal_only_warmup < 0) {
+        SetErrorMessage(error_message, "terminal-only warmup must be non-negative");
+        return false;
+    }
+    if (options.near_terminal_curriculum < 0) {
+        SetErrorMessage(error_message, "near-terminal curriculum must be non-negative");
+        return false;
+    }
 
     try {
         auto weights = BootstrapWeights();
@@ -1865,8 +2225,19 @@ bool RunBitboardTraining(const TrainingOptions& options,
             return false;
         }
 
+        const auto limits = NormalizeSingleThreadLimits(options.limits);
         auto local_summary = TrainingSummary{};
         local_summary.games_requested = options.games;
+        local_summary.seed = options.seed;
+        local_summary.depth = limits.max_depth;
+        local_summary.alpha = options.alpha;
+        local_summary.lambda = options.lambda;
+        local_summary.epsilon = options.epsilon;
+        local_summary.epsilon_plies = options.epsilon_plies;
+        local_summary.terminal_reward = options.terminal_reward;
+        local_summary.td_error_clip = options.td_error_clip;
+        local_summary.terminal_only_warmup = options.terminal_only_warmup;
+        local_summary.near_terminal_curriculum = options.near_terminal_curriculum;
         local_summary.output_weights_path = options.output_weights_path;
 
         if (options.games == 0) {
@@ -1880,7 +2251,6 @@ bool RunBitboardTraining(const TrainingOptions& options,
             return true;
         }
 
-        const auto limits = NormalizeSingleThreadLimits(options.limits);
         auto controller = SearchController{};
         auto traces = std::vector<double>(weights.values.size(), 0.0);
         auto rng = std::mt19937(options.seed);
@@ -1888,27 +2258,31 @@ bool RunBitboardTraining(const TrainingOptions& options,
         auto total_abs_td_error = 0.0;
         auto total_abs_weight_delta = 0.0;
 
+        const auto curriculum_games = std::max(options.terminal_only_warmup, options.near_terminal_curriculum);
         for (int game_index = 0; game_index < options.games; ++game_index) {
-            auto position = LoadPositionFromFileOrDefault("");
-            std::fill(traces.begin(), traces.end(), 0.0);
+            auto position = game_index < curriculum_games
+                                ? BuildNearTerminalTrainingPosition(game_index)
+                                : LoadPositionFromFileOrDefault("");
+            ResetTrainingTraces(traces);
             int plies = 0;
 
             for (;;) {
                 if (EvaluateTerminal(position) != std::numeric_limits<int>::min()) {
-                    AccumulateOutcome(WinnerColorFromPosition(position), local_summary);
+                    const auto winner = WinnerColorFromPosition(position);
+                    if (position.no_capture_ply >= position.max_no_capture_round) {
+                        AccumulateNoCaptureTerminal(winner, local_summary);
+                    } else {
+                        AccumulateCheckmateTerminal(winner, local_summary);
+                    }
                     break;
                 }
 
                 auto legal_moves = MoveList{};
                 GenerateMoves(position, legal_moves);
                 if (legal_moves.size == 0) {
-                    AccumulateOutcome(WinnerColorFromPosition(position), local_summary);
+                    AccumulateNoLegalMoveTerminal(WinnerColorFromPosition(position), local_summary);
                     break;
                 }
-
-                auto active_indices = std::vector<int>{};
-                weights.EnumerateActiveWeightIndices(position, active_indices);
-                const auto current_value = EvaluateWeightsForSideToMove(weights, position);
 
                 auto chosen_move = Move{};
                 if (plies < options.epsilon_plies && random_unit(rng) < options.epsilon) {
@@ -1925,44 +2299,54 @@ bool RunBitboardTraining(const TrainingOptions& options,
                 auto undo = Undo{};
                 MakeMove(next, chosen_move, undo);
 
-                auto target_value = TrainingTargetFromAfterMove(next);
-                if (std::isnan(target_value)) {
-                    target_value = -EvaluateWeightsForSideToMove(weights, next);
+                auto context = TrainingStepContext{};
+                context.next_is_ply_cap = (plies + 1) >= kTrainingMaxPlies;
+                const auto next_terminal = EvaluateTerminal(next) != std::numeric_limits<int>::min();
+                auto next_legal_moves = MoveList{};
+                if (!next_terminal && !context.next_is_ply_cap) {
+                    GenerateMoves(next, next_legal_moves);
+                    context.next_has_legal_moves = next_legal_moves.size > 0;
                 }
 
-                for (auto& trace : traces) {
-                    trace *= options.lambda;
+                auto step_result = TrainingStepResult{};
+                if (!ApplyTrainingStep(weights,
+                                       traces,
+                                       position,
+                                       next,
+                                       context,
+                                       options.alpha,
+                                       options.lambda,
+                                       &step_result,
+                                       options.terminal_reward,
+                                       options.td_error_clip)) {
+                    SetErrorMessage(error_message, "failed to apply training td step");
+                    return false;
                 }
-                const auto feature_sign = position.SideToMove() == Color::Black ? 1.0 : -1.0;
-                for (const auto index : active_indices) {
-                    traces[static_cast<std::size_t>(index)] += feature_sign;
-                }
-
-                const auto delta = target_value - current_value;
                 ++local_summary.positions_evaluated;
                 ++local_summary.update_count;
-                total_abs_td_error += std::abs(delta);
-                local_summary.max_abs_td_error = std::max(local_summary.max_abs_td_error, std::abs(delta));
-
-                auto step_abs_weight_delta = 0.0;
-                for (std::size_t i = 0; i < weights.values.size(); ++i) {
-                    if (traces[i] == 0.0) {
-                        continue;
-                    }
-                    const auto change = options.alpha * delta * traces[i];
-                    if (change == 0.0) {
-                        continue;
-                    }
-                    weights.values[i] = std::clamp(weights.values[i] + change, -kTrainingWeightClamp, kTrainingWeightClamp);
-                    step_abs_weight_delta += std::abs(change);
-                }
-                total_abs_weight_delta += step_abs_weight_delta;
-                local_summary.max_abs_weight_delta = std::max(local_summary.max_abs_weight_delta, step_abs_weight_delta);
+                total_abs_td_error += std::abs(step_result.td_error);
+                local_summary.max_abs_td_error = std::max(local_summary.max_abs_td_error, std::abs(step_result.td_error));
+                total_abs_weight_delta += step_result.abs_weight_delta;
+                local_summary.max_abs_weight_delta =
+                    std::max(local_summary.max_abs_weight_delta, step_result.abs_weight_delta);
 
                 position = next;
                 ++plies;
-                if (EvaluateTerminal(position) != std::numeric_limits<int>::min()) {
-                    AccumulateOutcome(WinnerColorFromPosition(position), local_summary);
+                if (next_terminal) {
+                    const auto winner = WinnerColorFromPosition(position);
+                    if (position.no_capture_ply >= position.max_no_capture_round) {
+                        AccumulateNoCaptureTerminal(winner, local_summary);
+                    } else {
+                        AccumulateCheckmateTerminal(winner, local_summary);
+                    }
+                    break;
+                }
+                if (!context.next_has_legal_moves) {
+                    AccumulateNoLegalMoveTerminal(WinnerColorFromPosition(position), local_summary);
+                    break;
+                }
+                if (context.next_is_ply_cap) {
+                    AccumulatePlyCapTerminal(WinnerColorFromPosition(position), local_summary);
                     break;
                 }
             }
@@ -1980,6 +2364,11 @@ bool RunBitboardTraining(const TrainingOptions& options,
                     return false;
                 }
                 ++local_summary.checkpoint_count;
+                local_summary.checkpoint_summaries.push_back(
+                    BuildTrainingCheckpointSummary(local_summary,
+                                                   checkpoint_path.string(),
+                                                   total_abs_td_error,
+                                                   total_abs_weight_delta));
             }
         }
 
@@ -2034,9 +2423,14 @@ bool RunBitboardEvaluation(const EvalOptions& options,
         }
 
         const auto limits = NormalizeSingleThreadLimits(options.limits);
-        const auto middlegame_path = ResolveEvaluationDataPath("game1.txt");
+        const auto capture_heavy_path = ResolveEvaluationDataPath("game1.txt");
+        const auto threat_heavy_path = ResolveEvaluationDataPath("game10.txt");
         const auto endgame_path = ResolveEvaluationDataPath("game6.txt");
-        if (middlegame_path.empty() || endgame_path.empty()) {
+        const auto no_capture_critical_path = ResolveEvaluationDataPath("game8.txt");
+        if (capture_heavy_path.empty() ||
+            threat_heavy_path.empty() ||
+            endgame_path.empty() ||
+            no_capture_critical_path.empty()) {
             SetErrorMessage(error_message, "failed to resolve benchmark test positions");
             return false;
         }
@@ -2046,10 +2440,12 @@ bool RunBitboardEvaluation(const EvalOptions& options,
         local_report.baseline_weights = baseline_label;
         local_report.depth = limits.max_depth;
 
-        const auto cases = std::array<std::pair<std::string, std::string>, 3>{
+        const auto cases = std::array<std::pair<std::string, std::string>, 5>{
             std::pair<std::string, std::string>{"opening", ""},
-            {"middlegame", middlegame_path.string()},
+            {"capture-heavy", capture_heavy_path.string()},
+            {"threat-heavy", threat_heavy_path.string()},
             {"endgame", endgame_path.string()},
+            {"no-capture-critical", no_capture_critical_path.string()},
         };
 
         for (const auto& [case_id, file_name] : cases) {

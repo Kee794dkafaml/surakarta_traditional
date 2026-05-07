@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 
@@ -44,6 +45,8 @@ struct StartupOptions {
     bool smoke_test{false};
     bool smoke_test_init{false};
     bool smoke_test_geometry{false};
+    bool smoke_test_coordinate_convention{false};
+    bool smoke_test_sidebar_labels{false};
     std::string file_name;
     int depth{4};
     int threads{DefaultThreadCount()};
@@ -58,6 +61,7 @@ struct Palette {
     ImU32 capture_target{IM_COL32(186, 74, 47, 220)};
     ImU32 selected{IM_COL32(218, 172, 52, 255)};
     ImU32 hover_path{IM_COL32(240, 133, 52, 255)};
+    ImU32 last_move_path{IM_COL32(42, 126, 102, 190)};
     ImU32 black_piece{IM_COL32(36, 34, 31, 255)};
     ImU32 white_piece{IM_COL32(245, 242, 234, 255)};
     ImU32 white_piece_outline{IM_COL32(84, 78, 67, 255)};
@@ -147,6 +151,71 @@ std::string FormatPrincipalVariation(
         surakarta::bitboard::MakeMove(working, move, undo);
     }
     return text.empty() ? "n/a" : text;
+}
+
+std::string FormatPath(const std::vector<SurakartaMovePathFragment>& path) {
+    auto stream = std::ostringstream{};
+    for (std::size_t i = 0; i < path.size(); ++i) {
+        if (i > 0) {
+            stream << " | ";
+        }
+
+        const auto& fragment = path[i];
+        if (!fragment.is_curve) {
+            stream << "(" << fragment.info.straight.start_x << ", " << fragment.info.straight.start_y << ") -> ("
+                   << fragment.info.straight.end_x << ", " << fragment.info.straight.end_y << ")";
+            continue;
+        }
+
+        stream << "arc center=(" << fragment.info.curve.center_x << ", " << fragment.info.curve.center_y << ")"
+               << " r=" << fragment.info.curve.radius
+               << " angles=" << fragment.info.curve.start_angle << "->" << fragment.info.curve.end_angle
+               << " clockwise=" << (fragment.info.curve.is_clockwise ? "true" : "false");
+    }
+    return stream.str();
+}
+
+struct SidebarMoveDisplay {
+    std::string label;
+    std::string move_text;
+    std::string pv_text;
+    std::string path_text;
+};
+
+std::vector<SurakartaMovePathFragment> CapturePathForMove(const surakarta::bitboard::Position& position, Move move) {
+    if (!move.IsCapture()) {
+        return {};
+    }
+    return surakarta::bitboard::ReconstructCapturePath(position, move.from, move.to, move.aux);
+}
+
+SidebarMoveDisplay BuildSidebarMoveDisplay(const surakarta::bitboard::Position& position,
+                                           const surakarta::bitboard::SearchSnapshot& snapshot,
+                                           bool is_engine_turn,
+                                           const std::optional<Move>& last_move,
+                                           const std::vector<SurakartaMovePathFragment>& last_move_path) {
+    const bool snapshot_is_current_search = snapshot.active || is_engine_turn;
+    auto display = SidebarMoveDisplay{};
+    if (snapshot_is_current_search) {
+        display.label = "Best Move";
+        display.move_text = FormatMove(snapshot.best_move);
+        display.pv_text = FormatPrincipalVariation(position, snapshot.pv, snapshot.pv_length);
+        display.path_text = FormatPath(CapturePathForMove(position, snapshot.best_move));
+        return display;
+    }
+
+    if (last_move.has_value()) {
+        display.label = "Last Move";
+        display.move_text = FormatMove(*last_move);
+        display.path_text = FormatPath(last_move_path);
+        return display;
+    }
+
+    display.label = "Best Move";
+    display.move_text = FormatMove(snapshot.best_move);
+    display.pv_text = FormatPrincipalVariation(position, snapshot.pv, snapshot.pv_length);
+    display.path_text = FormatPath(CapturePathForMove(position, snapshot.best_move));
+    return display;
 }
 
 void GlfwErrorCallback(int error, const char* description) {
@@ -317,6 +386,79 @@ int RunBoardGeometrySmoke() {
     return 0;
 }
 
+int RunCoordinateConventionSmoke() {
+    auto okay = true;
+    const auto square = MakeSquare(2, 3);
+    const auto layout = MakeBoardLayout(ImVec2(0.0f, 0.0f), ImVec2(720.0f, 720.0f));
+    const auto detected = DetectSquare(layout, BoardPoint(layout, 2, 3));
+    const auto move = Move{MakeSquare(2, 3), MakeSquare(2, 1), surakarta::bitboard::MoveCapture, 0};
+
+    if (FormatSquare(square) != "(2, 3)") {
+        std::fputs("surakarta-gui coordinate smoke failed: FormatSquare must use GUI x,y order\n", stderr);
+        okay = false;
+    }
+    if (!detected.has_value() || *detected != square) {
+        std::fputs("surakarta-gui coordinate smoke failed: board hit-test must round-trip GUI x,y order\n", stderr);
+        okay = false;
+    }
+    if (FormatMove(move) != "(2, 3) -> (2, 1) x") {
+        std::fputs("surakarta-gui coordinate smoke failed: FormatMove must match FormatSquare convention\n", stderr);
+        okay = false;
+    }
+    if (!okay) {
+        return 1;
+    }
+
+    std::puts("[PASS] surakarta-gui coordinate convention smoke");
+    return 0;
+}
+
+int RunSidebarLabelSmoke() {
+    auto position = surakarta::bitboard::Position{};
+    position.board.SetPiece(Color::Black, MakeSquare(2, 3));
+    position.board.SetPiece(Color::White, MakeSquare(2, 1));
+    position.side_to_move = static_cast<std::uint8_t>(Color::Black);
+    position.zobrist_key = surakarta::bitboard::ComputeZobrist(position);
+
+    auto snapshot = surakarta::bitboard::SearchSnapshot{};
+    snapshot.best_move = Move{MakeSquare(2, 3), MakeSquare(2, 1), surakarta::bitboard::MoveCapture, 0};
+    snapshot.pv[0] = snapshot.best_move;
+    snapshot.pv_length = 1;
+    const auto last_move = Move{MakeSquare(5, 4), MakeSquare(4, 3), surakarta::bitboard::MoveQuiet, 0};
+    const auto last_path = std::vector<SurakartaMovePathFragment>{
+        SurakartaMovePathFragment(5, 4, 5, 5),
+        SurakartaMovePathFragment(5, 5, 1, 3, 2, false),
+        SurakartaMovePathFragment(4, 5, 4, 3),
+    };
+
+    auto okay = true;
+    const auto completed_display =
+        BuildSidebarMoveDisplay(position, snapshot, false, last_move, last_path);
+    if (completed_display.label != "Last Move" ||
+        completed_display.move_text != "(5, 4) -> (4, 3)" ||
+        completed_display.path_text.find("arc center=") == std::string::npos) {
+        std::fputs("surakarta-gui sidebar smoke failed: completed engine moves must show Last Move with path\n", stderr);
+        okay = false;
+    }
+
+    snapshot.active = true;
+    const auto active_display =
+        BuildSidebarMoveDisplay(position, snapshot, false, last_move, last_path);
+    if (active_display.label != "Best Move" ||
+        active_display.move_text != "(2, 3) -> (2, 1) x" ||
+        active_display.pv_text.empty()) {
+        std::fputs("surakarta-gui sidebar smoke failed: active searches must show Best Move/PV\n", stderr);
+        okay = false;
+    }
+
+    if (!okay) {
+        return 1;
+    }
+
+    std::puts("[PASS] surakarta-gui sidebar label smoke");
+    return 0;
+}
+
 void DrawPathFragments(ImDrawList* draw_list,
                        const BoardLayout& layout,
                        const std::vector<SurakartaMovePathFragment>& path,
@@ -404,6 +546,10 @@ void RenderBoard(DevelopmentSession& session,
         if (target.IsCapture()) {
             draw_list->AddCircle(center, layout.piece_radius * 0.82f, color, 0, 2.0f);
         }
+    }
+
+    if (!session.LastMovePath().empty()) {
+        DrawPathFragments(draw_list, layout, session.LastMovePath(), palette.last_move_path, 3.0f);
     }
 
     if (!session.HoverPath().empty()) {
@@ -507,6 +653,20 @@ void RenderSidebar(DevelopmentSession& session,
         session.Reset();
         sidebar.status_message = "Reset to initial position.";
     }
+    const bool can_undo = session.CanUndo();
+    if (!can_undo) {
+        ImGui::BeginDisabled();
+    }
+    if (ImGui::Button("Undo Human Turn")) {
+        if (session.UndoHumanTurn()) {
+            sidebar.status_message = "Undid the last human turn.";
+        } else {
+            sidebar.status_message = "No completed human turn can be undone yet.";
+        }
+    }
+    if (!can_undo) {
+        ImGui::EndDisabled();
+    }
 
     if (!sidebar.status_message.empty()) {
         ImGui::TextWrapped("%s", sidebar.status_message.c_str());
@@ -535,8 +695,18 @@ void RenderSidebar(DevelopmentSession& session,
     ImGui::Text("Aborted Root Tasks: %llu", static_cast<unsigned long long>(snapshot.aborted_root_tasks));
     ImGui::Text("Worker Idle Spins: %llu", static_cast<unsigned long long>(snapshot.worker_idle_spins));
     ImGui::Text("Thread Spawns: %llu", static_cast<unsigned long long>(snapshot.thread_spawn_count));
-    ImGui::Text("Best Move: %s", FormatMove(snapshot.best_move).c_str());
-    ImGui::TextWrapped("PV: %s", FormatPrincipalVariation(position, snapshot.pv, snapshot.pv_length).c_str());
+    const auto move_display = BuildSidebarMoveDisplay(position,
+                                                      snapshot,
+                                                      session.IsEngineTurn(),
+                                                      session.LastMove(),
+                                                      session.LastMovePath());
+    ImGui::Text("%s: %s", move_display.label.c_str(), move_display.move_text.c_str());
+    if (!move_display.pv_text.empty()) {
+        ImGui::TextWrapped("PV: %s", move_display.pv_text.c_str());
+    }
+    if (!move_display.path_text.empty()) {
+        ImGui::TextWrapped("%s Path: %s", move_display.label.c_str(), move_display.path_text.c_str());
+    }
 
     if (session.SelectedSquare().has_value()) {
         ImGui::Separator();
@@ -570,6 +740,10 @@ StartupOptions ParseArgs(int argc, char** argv) {
             options.smoke_test_init = true;
         } else if (arg == "--smoke-test-geometry") {
             options.smoke_test_geometry = true;
+        } else if (arg == "--smoke-test-coordinate-convention") {
+            options.smoke_test_coordinate_convention = true;
+        } else if (arg == "--smoke-test-sidebar-labels") {
+            options.smoke_test_sidebar_labels = true;
         } else if ((arg == "--file" || arg == "-f") && i + 1 < argc) {
             options.file_name = argv[++i];
         } else if ((arg == "--depth" || arg == "-d") && i + 1 < argc) {
@@ -663,6 +837,12 @@ int main(int argc, char** argv) {
     }
     if (options.smoke_test_geometry) {
         return RunBoardGeometrySmoke();
+    }
+    if (options.smoke_test_coordinate_convention) {
+        return RunCoordinateConventionSmoke();
+    }
+    if (options.smoke_test_sidebar_labels) {
+        return RunSidebarLabelSmoke();
     }
 
     auto session = DevelopmentSession{};

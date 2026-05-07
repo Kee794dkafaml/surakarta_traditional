@@ -58,7 +58,30 @@ if(NOT TARGET surakarta-mask-export)
     )
     target_compile_definitions(surakarta-mask-export PRIVATE SURAKARTA_DYNAMIC_MASKS=1)
     target_include_directories(surakarta-mask-export PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+    if(MSVC)
+        target_compile_options(surakarta-mask-export PRIVATE /EHsc)
+    endif()
     install(TARGETS surakarta-mask-export)
+endif()
+
+if(NOT TARGET surakarta-mask-capacity-failfast)
+    add_executable(surakarta-mask-capacity-failfast
+        surakarta_mask_export.cpp
+        surakarta_bitboard.cpp
+    )
+    target_compile_definitions(surakarta-mask-capacity-failfast PRIVATE
+        SURAKARTA_DYNAMIC_MASKS=1
+        SURAKARTA_CAPTURE_VARIANT_CAPACITY=4
+    )
+    target_include_directories(surakarta-mask-capacity-failfast PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+    if(MSVC)
+        target_compile_options(surakarta-mask-capacity-failfast PRIVATE /EHsc)
+    endif()
+    add_test(
+        NAME surakarta-mask-capacity-failfast
+        COMMAND surakarta-mask-capacity-failfast "${CMAKE_BINARY_DIR}/capture-capacity-should-fail.h"
+    )
+    set_tests_properties(surakarta-mask-capacity-failfast PROPERTIES WILL_FAIL TRUE)
 endif()
 
 if(SURAKARTA_ENABLE_GUI AND NOT TARGET surakarta-gui)
@@ -109,8 +132,14 @@ if(SURAKARTA_ENABLE_GUI AND NOT TARGET surakarta-gui)
         COMMAND surakarta-gui --smoke-test-init)
     add_test(NAME surakarta-gui-smoke-geometry
         COMMAND surakarta-gui --smoke-test-geometry)
+    add_test(NAME surakarta-gui-smoke-coordinate-convention
+        COMMAND surakarta-gui --smoke-test-coordinate-convention)
+    add_test(NAME surakarta-gui-smoke-sidebar-labels
+        COMMAND surakarta-gui --smoke-test-sidebar-labels)
     set_tests_properties(surakarta-gui-smoke-session PROPERTIES TIMEOUT 10)
     set_tests_properties(surakarta-gui-smoke-init PROPERTIES TIMEOUT 10)
     set_tests_properties(surakarta-gui-smoke-geometry PROPERTIES TIMEOUT 10)
+    set_tests_properties(surakarta-gui-smoke-coordinate-convention PROPERTIES TIMEOUT 10)
+    set_tests_properties(surakarta-gui-smoke-sidebar-labels PROPERTIES TIMEOUT 10)
     install(TARGETS surakarta-gui)
 endif()

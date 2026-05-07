@@ -1,0 +1,12 @@
+B B B B . B
+B B W B B B
+. B . . . .
+. . . W . .
+W W . W W W
+W W . W W W
+current_player: B
+num_round: 10
+last_captured_round: 4
+end_reason: NONE
+winner: .
+max_no_capture_round: 40

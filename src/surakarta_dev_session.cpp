@@ -61,6 +61,7 @@ void DevelopmentSession::SetHumanColor(bitboard::Color color) {
     }
     CancelSearch();
     human_color_ = color;
+    ClearUndoHistory();
     RebuildSelection();
     RebuildHoverPath();
     StartEngineSearchIfNeeded();
@@ -112,6 +113,7 @@ bool DevelopmentSession::ApplyHumanMove(bitboard::Square destination) {
     move.to = target->to;
     move.flags = target->flags;
     move.aux = target->primary_variant;
+    PushHumanTurnSnapshot();
     ApplyMove(move);
     return true;
 }
@@ -121,6 +123,29 @@ void DevelopmentSession::ClearSelection() {
     hovered_target_.reset();
     legal_targets_.clear();
     hover_path_.clear();
+}
+
+bool DevelopmentSession::CanUndo() const {
+    return !SearchActive() && position_.SideToMove() == human_color_ && !undo_stack_.empty();
+}
+
+bool DevelopmentSession::UndoHumanTurn() {
+    Update();
+    if (!CanUndo()) {
+        return false;
+    }
+
+    const auto generation = AdvanceGeneration();
+    const auto snapshot = undo_stack_.back();
+    undo_stack_.pop_back();
+    position_ = snapshot.position;
+    status_ = snapshot.status;
+    last_move_ = snapshot.last_move;
+    last_move_path_ = snapshot.last_move_path;
+    ClearSelection();
+    ResetSearchArtifacts(generation);
+    RefreshDerivedState();
+    return true;
 }
 
 void DevelopmentSession::SetHoveredTarget(bitboard::Square square) {
@@ -182,7 +207,9 @@ bool DevelopmentSession::LoadPosition(const std::string& file_name, std::string*
 
     position_ = loaded;
     loaded_file_ = file_name;
+    ClearUndoHistory();
     last_move_.reset();
+    last_move_path_.clear();
     ClearSelection();
     ResetSearchArtifacts(active_generation_.load(std::memory_order_acquire));
     RefreshDerivedState();
@@ -284,6 +311,15 @@ void DevelopmentSession::RefreshDerivedState() {
 
 void DevelopmentSession::ApplyMove(bitboard::Move move, bool preserve_completed_snapshot) {
     const auto generation = AdvanceGeneration();
+    last_move_path_.clear();
+    if (move.IsCapture()) {
+        last_move_path_ = bitboard::ReconstructCapturePath(position_, move.from, move.to, move.aux);
+    } else if (move.IsQuiet()) {
+        const auto from = bitboard::PositionAdapter::ToLegacyPosition(move.from);
+        const auto to = bitboard::PositionAdapter::ToLegacyPosition(move.to);
+        last_move_path_.push_back(SurakartaMovePathFragment(from.x, from.y, to.x, to.y));
+    }
+
     auto undo = bitboard::Undo{};
     bitboard::MakeMove(position_, move, undo);
     last_move_ = move;
@@ -298,6 +334,14 @@ void DevelopmentSession::ApplyMove(bitboard::Move move, bool preserve_completed_
     }
     RefreshDerivedState();
     StartEngineSearchIfNeeded();
+}
+
+void DevelopmentSession::PushHumanTurnSnapshot() {
+    undo_stack_.push_back(HumanTurnSnapshot{position_, status_, last_move_, last_move_path_});
+}
+
+void DevelopmentSession::ClearUndoHistory() {
+    undo_stack_.clear();
 }
 
 void DevelopmentSession::ApplyCompletedSearchIfReady() {

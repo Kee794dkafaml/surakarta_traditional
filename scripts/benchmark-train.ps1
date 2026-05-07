@@ -3,7 +3,15 @@ param(
     [int]$Games = 4,
     [int]$Depth = 4,
     [int]$Seed = 20260423,
-    [int]$CheckpointEvery = 2
+    [int]$CheckpointEvery = 2,
+    [double]$Alpha = 0.005,
+    [double]$Lambda = 0.5,
+    [double]$Epsilon = 0.02,
+    [int]$EpsilonPlies = 6,
+    [double]$TerminalReward = 1200.0,
+    [double]$TdErrorClip = 0.0,
+    [int]$TerminalOnlyWarmup = 0,
+    [int]$NearTerminalCurriculum = 0
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
@@ -14,6 +22,22 @@ if ($Games -le 0) {
 
 if ($CheckpointEvery -le 0) {
     throw 'Training smoke requires -CheckpointEvery to be greater than 0 so at least one checkpoint is archived.'
+}
+
+if ($TerminalReward -le 0.0) {
+    throw 'Training smoke requires -TerminalReward to be greater than 0.'
+}
+
+if ($TdErrorClip -lt 0.0) {
+    throw 'Training smoke requires -TdErrorClip to be non-negative.'
+}
+
+if ($TerminalOnlyWarmup -lt 0) {
+    throw 'Training smoke requires -TerminalOnlyWarmup to be non-negative.'
+}
+
+if ($NearTerminalCurriculum -lt 0) {
+    throw 'Training smoke requires -NearTerminalCurriculum to be non-negative.'
 }
 
 $repoRoot = Get-SurakartaRepoRoot
@@ -55,6 +79,47 @@ function New-TrainingRunLayout {
     }
 }
 
+function Write-CheckpointManifest {
+    param(
+        [string]$RepoRoot,
+        [string]$WeightPath,
+        [int]$Seed,
+        [int]$Games,
+        [int]$Depth,
+        [double]$Alpha,
+        [double]$Lambda,
+        [double]$Epsilon,
+        [int]$EpsilonPlies,
+        [double]$TerminalReward,
+        [double]$TdErrorClip,
+        [int]$TerminalOnlyWarmup,
+        [int]$NearTerminalCurriculum,
+        [int]$CheckpointEvery,
+        [int]$CheckpointGames
+    )
+
+    return Write-SurakartaWeightManifest -RepoRoot $RepoRoot `
+        -WeightPath $WeightPath `
+        -ArtifactKind 'checkpoint' `
+        -Seed $Seed `
+        -Games $Games `
+        -Depth $Depth `
+        -Alpha $Alpha `
+        -Lambda $Lambda `
+        -Epsilon $Epsilon `
+        -EpsilonPlies $EpsilonPlies `
+        -TerminalReward $TerminalReward `
+        -TdErrorClip $TdErrorClip `
+        -TerminalOnlyWarmup $TerminalOnlyWarmup `
+        -NearTerminalCurriculum $NearTerminalCurriculum `
+        -CheckpointEvery $CheckpointEvery `
+        -Checkpoint ([ordered]@{
+            is_checkpoint = $true
+            name = [System.IO.Path]::GetFileName($WeightPath)
+            games_completed = $CheckpointGames
+        })
+}
+
 function Invoke-LoggedBenchmarkCommand {
     param(
         [string]$Name,
@@ -73,7 +138,7 @@ function Invoke-LoggedBenchmarkCommand {
         -NoNewWindow `
         -PassThru
 
-    Wait-Process -Id $process.Id
+    $process.WaitForExit()
     $process.Refresh()
     if ($process.ExitCode -ne 0) {
         throw "Command '$Name' failed with exit code $($process.ExitCode). See $stdoutLog and $stderrLog."
@@ -172,7 +237,7 @@ function Normalize-EvalJsonValue {
 
     if ($Value -is [System.Collections.IDictionary]) {
         $normalizedObject = [ordered]@{}
-        foreach ($key in $Value.Keys) {
+        foreach ($key in @($Value.Keys | Sort-Object)) {
             if ($key -eq 'search_seconds') {
                 continue
             }
@@ -226,12 +291,25 @@ function Get-NormalizedEvalTextHash {
 }
 
 function Run-TrainingSmokePass {
-    param([pscustomobject]$Layout)
+    param(
+        [pscustomobject]$Layout,
+        [string]$RepoRoot
+    )
 
     $null = Invoke-LoggedBenchmarkCommand -Name 'bootstrap-export' -LogsDir $Layout.LogsDir -Arguments @(
         'bitboard-train',
         '--output', $Layout.BootstrapWeights,
         '--games', '0',
+        '--depth', "$Depth",
+        '--seed', "$Seed",
+        '--alpha', "$Alpha",
+        '--lambda', "$Lambda",
+        '--epsilon', "$Epsilon",
+        '--epsilon-plies', "$EpsilonPlies",
+        '--terminal-reward', "$TerminalReward",
+        '--td-error-clip', "$TdErrorClip",
+        '--terminal-only-warmup', "$TerminalOnlyWarmup",
+        '--near-terminal-curriculum', "$NearTerminalCurriculum",
         '--format', 'json'
     )
 
@@ -242,6 +320,14 @@ function Run-TrainingSmokePass {
         '--games', "$Games",
         '--depth', "$Depth",
         '--seed', "$Seed",
+        '--alpha', "$Alpha",
+        '--lambda', "$Lambda",
+        '--epsilon', "$Epsilon",
+        '--epsilon-plies', "$EpsilonPlies",
+        '--terminal-reward', "$TerminalReward",
+        '--td-error-clip', "$TdErrorClip",
+        '--terminal-only-warmup', "$TerminalOnlyWarmup",
+        '--near-terminal-curriculum', "$NearTerminalCurriculum",
         '--format', 'json',
         '--checkpoint-every', "$CheckpointEvery",
         '--checkpoint-dir', $Layout.CheckpointsDir
@@ -300,6 +386,65 @@ function Run-TrainingSmokePass {
     }
 
     $checkpointHashes = Get-CheckpointHashes -Directory $Layout.CheckpointsDir
+    $artifacts = @()
+    $artifacts += Write-SurakartaWeightManifest -RepoRoot $RepoRoot `
+        -WeightPath $Layout.BootstrapWeights `
+        -ArtifactKind 'bootstrap' `
+        -Seed $Seed `
+        -Games 0 `
+        -Depth $Depth `
+        -Alpha $Alpha `
+        -Lambda $Lambda `
+        -Epsilon $Epsilon `
+        -EpsilonPlies $EpsilonPlies `
+        -TerminalReward $TerminalReward `
+        -TdErrorClip $TdErrorClip `
+        -TerminalOnlyWarmup $TerminalOnlyWarmup `
+        -NearTerminalCurriculum $NearTerminalCurriculum `
+        -CheckpointEvery $CheckpointEvery `
+        -Checkpoint ([ordered]@{
+            is_checkpoint = $false
+            name = $null
+            games_completed = 0
+        })
+    $artifacts += Write-SurakartaWeightManifest -RepoRoot $RepoRoot `
+        -WeightPath $Layout.CandidateWeights `
+        -ArtifactKind 'candidate' `
+        -Seed $Seed `
+        -Games $Games `
+        -Depth $Depth `
+        -Alpha $Alpha `
+        -Lambda $Lambda `
+        -Epsilon $Epsilon `
+        -EpsilonPlies $EpsilonPlies `
+        -TerminalReward $TerminalReward `
+        -TdErrorClip $TdErrorClip `
+        -TerminalOnlyWarmup $TerminalOnlyWarmup `
+        -NearTerminalCurriculum $NearTerminalCurriculum `
+        -CheckpointEvery $CheckpointEvery `
+        -Checkpoint ([ordered]@{
+            is_checkpoint = $false
+            name = $null
+            games_completed = $candidateSummary.games_completed
+        })
+    foreach ($checkpointFile in @(Get-ChildItem -Path $Layout.CheckpointsDir -Filter '*.bin' -File | Sort-Object Name)) {
+        $checkpointGames = [int]([regex]::Match($checkpointFile.BaseName, 'checkpoint-(\d+)').Groups[1].Value)
+        $artifacts += Write-CheckpointManifest -RepoRoot $RepoRoot `
+            -WeightPath $checkpointFile.FullName `
+            -Seed $Seed `
+            -Games $Games `
+            -Depth $Depth `
+            -Alpha $Alpha `
+            -Lambda $Lambda `
+            -Epsilon $Epsilon `
+            -EpsilonPlies $EpsilonPlies `
+            -TerminalReward $TerminalReward `
+            -TdErrorClip $TdErrorClip `
+            -TerminalOnlyWarmup $TerminalOnlyWarmup `
+            -NearTerminalCurriculum $NearTerminalCurriculum `
+            -CheckpointEvery $CheckpointEvery `
+            -CheckpointGames $checkpointGames
+    }
     $signature = [ordered]@{
         bootstrap = $bootstrapHash
         candidate = $candidateHash
@@ -313,6 +458,7 @@ function Run-TrainingSmokePass {
         RunRoot = $Layout.RunRoot
         CandidateSummary = $candidateSummary
         Signature = $signature
+        Artifacts = $artifacts
     }
 }
 
@@ -322,9 +468,29 @@ function Compare-RunSignatures {
         [pscustomobject]$Second
     )
 
-    $left = $First.Signature | ConvertTo-Json -Depth 6 -Compress
-    $right = $Second.Signature | ConvertTo-Json -Depth 6 -Compress
-    return $left -eq $right
+    if ($First.Signature.bootstrap -ne $Second.Signature.bootstrap) {
+        return $false
+    }
+    if ($First.Signature.candidate -ne $Second.Signature.candidate) {
+        return $false
+    }
+
+    $firstCheckpointKeys = @($First.Signature.checkpoints.Keys | Sort-Object)
+    $secondCheckpointKeys = @($Second.Signature.checkpoints.Keys | Sort-Object)
+    if ($firstCheckpointKeys.Count -ne $secondCheckpointKeys.Count) {
+        return $false
+    }
+
+    for ($i = 0; $i -lt $firstCheckpointKeys.Count; ++$i) {
+        if ($firstCheckpointKeys[$i] -ne $secondCheckpointKeys[$i]) {
+            return $false
+        }
+        if ($First.Signature.checkpoints[$firstCheckpointKeys[$i]] -ne $Second.Signature.checkpoints[$secondCheckpointKeys[$i]]) {
+            return $false
+        }
+    }
+
+    return $true
 }
 
 Invoke-SurakartaConfigure -Configuration 'Release' -BuildDir $BuildDir
@@ -333,8 +499,12 @@ Invoke-SurakartaBuild -BuildDir $BuildDir -Targets @('surakarta-benchmark')
 New-Item -ItemType Directory -Force -Path $sessionRoot | Out-Null
 Stop-SurakartaWorkspaceProcesses -WorkspaceRoot $repoRoot | Out-Null
 
-$runOne = Run-TrainingSmokePass -Layout (New-TrainingRunLayout -Root $sessionRoot -Name 'run-1')
-$runTwo = Run-TrainingSmokePass -Layout (New-TrainingRunLayout -Root $sessionRoot -Name 'run-2')
+$runOne = Run-TrainingSmokePass -Layout (New-TrainingRunLayout -Root $sessionRoot -Name 'run-1') -RepoRoot $repoRoot
+$runTwo = Run-TrainingSmokePass -Layout (New-TrainingRunLayout -Root $sessionRoot -Name 'run-2') -RepoRoot $repoRoot
+
+$allArtifacts = @($runOne.Artifacts + $runTwo.Artifacts)
+$sessionManifestPath = Join-Path $sessionRoot 'weights-manifest.json'
+$sessionManifest = Write-SurakartaSessionWeightManifest -RepoRoot $repoRoot -Path $sessionManifestPath -Purpose 'training' -Artifacts $allArtifacts
 
 if (-not (Compare-RunSignatures -First $runOne -Second $runTwo)) {
     throw "Training smoke is not reproducible for seed $Seed. Compare $($runOne.RunRoot) and $($runTwo.RunRoot)."
@@ -345,7 +515,12 @@ $reproSummary = [ordered]@{
     games = $Games
     depth = $Depth
     checkpoint_every = $CheckpointEvery
+    terminal_reward = $TerminalReward
+    td_error_clip = $TdErrorClip
+    terminal_only_warmup = $TerminalOnlyWarmup
+    near_terminal_curriculum = $NearTerminalCurriculum
     reproducible = $true
+    manifest = $sessionManifest
     runs = @(
         [ordered]@{
             name = $runOne.Name
@@ -366,6 +541,10 @@ $reproSummary | ConvertTo-Json -Depth 8 | Set-Content -Path $reproJsonPath
     "games: $Games"
     "depth: $Depth"
     "checkpoint_every: $CheckpointEvery"
+    "terminal_reward: $TerminalReward"
+    "td_error_clip: $TdErrorClip"
+    "terminal_only_warmup: $TerminalOnlyWarmup"
+    "near_terminal_curriculum: $NearTerminalCurriculum"
     "reproducible: True"
     "run-1: $($runOne.RunRoot)"
     "run-2: $($runTwo.RunRoot)"

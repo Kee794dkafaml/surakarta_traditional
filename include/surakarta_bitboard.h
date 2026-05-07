@@ -8,12 +8,17 @@
 
 #include "surakarta_common.h"
 
+#ifndef SURAKARTA_CAPTURE_VARIANT_CAPACITY
+#define SURAKARTA_CAPTURE_VARIANT_CAPACITY 8
+#endif
+
 namespace surakarta::bitboard {
 
 constexpr int kBoardSize = BOARD_SIZE;
 constexpr int kSquareCount = BOARD_SIZE * BOARD_SIZE;
 constexpr int kMoveListCapacity = 512;
-constexpr int kMaxCaptureVariants = 4;
+constexpr int kMaxCaptureVariants = SURAKARTA_CAPTURE_VARIANT_CAPACITY;
+static_assert(kMaxCaptureVariants > 0, "capture variant capacity must be positive");
 constexpr int kMaxPly = 64;
 constexpr std::uint8_t kInvalidSquare = 0xFF;
 

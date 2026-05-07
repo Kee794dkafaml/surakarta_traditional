@@ -1,3 +1,4 @@
+#include <exception>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -130,6 +131,11 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    WriteHeader(output);
+    try {
+        WriteHeader(output);
+    } catch (const std::exception& ex) {
+        std::cerr << "Failed to generate bitboard masks: " << ex.what() << std::endl;
+        return 1;
+    }
     return output.good() ? 0 : 1;
 }

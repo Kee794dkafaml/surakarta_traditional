@@ -34,6 +34,8 @@ class DevelopmentSession {
     bool SelectSquare(bitboard::Square square);
     bool ApplyHumanMove(bitboard::Square destination);
     void ClearSelection();
+    bool CanUndo() const;
+    bool UndoHumanTurn();
 
     void SetHoveredTarget(bitboard::Square square);
     void ClearHoveredTarget();
@@ -52,9 +54,17 @@ class DevelopmentSession {
     int EvalScore() const;
     SessionStatus Status() const { return status_; }
     std::optional<bitboard::Move> LastMove() const { return last_move_; }
+    const std::vector<SurakartaMovePathFragment>& LastMovePath() const { return last_move_path_; }
     const std::string& LoadedFile() const { return loaded_file_; }
 
    private:
+    struct HumanTurnSnapshot {
+        bitboard::Position position{};
+        SessionStatus status{};
+        std::optional<bitboard::Move> last_move;
+        std::vector<SurakartaMovePathFragment> last_move_path;
+    };
+
     struct CompletedSearch {
         std::uint64_t generation{0};
         bitboard::SearchResult result{};
@@ -68,6 +78,8 @@ class DevelopmentSession {
     void RebuildHoverPath();
     void RefreshDerivedState();
     void ApplyMove(bitboard::Move move, bool preserve_completed_snapshot = false);
+    void PushHumanTurnSnapshot();
+    void ClearUndoHistory();
     void ApplyCompletedSearchIfReady();
     void ResetSearchArtifacts(std::uint64_t generation, bool snapshot_active = false);
     void PublishSearchSnapshot(std::uint64_t generation, const bitboard::SearchSnapshot& snapshot);
@@ -85,6 +97,8 @@ class DevelopmentSession {
     std::optional<bitboard::Move> last_move_;
     std::vector<bitboard::LegalTargetInfo> legal_targets_;
     std::vector<SurakartaMovePathFragment> hover_path_;
+    std::vector<SurakartaMovePathFragment> last_move_path_;
+    std::vector<HumanTurnSnapshot> undo_stack_;
 
     std::thread search_thread_;
     std::atomic<bool> search_running_{false};

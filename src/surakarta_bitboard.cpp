@@ -8,6 +8,7 @@
 #include <bit>
 #include <optional>
 #include <stdexcept>
+#include <string>
 
 namespace surakarta::bitboard {
 
@@ -250,11 +251,15 @@ BitboardTables BitboardGenerator::Build() const {
                     if (passed_corner_count > 0 && current != from) {
                         tables.capture_target_mask[from] |= Bit(current);
                         auto& variant_count = tables.capture_variant_count[from][current];
-                        if (variant_count < kMaxCaptureVariants) {
-                            tables.capture_clear_mask[from][current][variant_count] = clear_mask;
-                            tables.capture_start_dir[from][current][variant_count] = static_cast<std::uint8_t>(start_dir);
-                            ++variant_count;
+                        if (variant_count >= kMaxCaptureVariants) {
+                            throw std::runtime_error(
+                                "capture variant count exceeds kMaxCaptureVariants from (" +
+                                std::to_string(SquareX(from)) + "," + std::to_string(SquareY(from)) + ") to (" +
+                                std::to_string(SquareX(current)) + "," + std::to_string(SquareY(current)) + ")");
                         }
+                        tables.capture_clear_mask[from][current][variant_count] = clear_mask;
+                        tables.capture_start_dir[from][current][variant_count] = static_cast<std::uint8_t>(start_dir);
+                        ++variant_count;
                     }
                     if (current != from) {
                         clear_mask |= Bit(current);

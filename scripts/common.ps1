@@ -239,6 +239,219 @@ function Invoke-SurakartaCTest {
     Assert-LastNativeExitCode -Step "ctest"
 }
 
+function Get-SurakartaGitCommit {
+    param([string]$RepoRoot = (Get-SurakartaRepoRoot))
+
+    $git = Get-Command git -ErrorAction SilentlyContinue
+    if ($null -eq $git) {
+        throw 'Unable to resolve git commit because git is not available.'
+    }
+
+    $commit = (& $git.Source -C $RepoRoot rev-parse HEAD 2>$null)
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($commit)) {
+        throw "Unable to resolve git commit for $RepoRoot."
+    }
+
+    return [string]$commit.Trim()
+}
+
+function Get-SurakartaFileSha256 {
+    param([string]$Path)
+
+    if (-not (Test-Path $Path)) {
+        throw "Missing expected file: $Path"
+    }
+
+    return (Get-FileHash -Path $Path -Algorithm SHA256).Hash
+}
+
+function Get-SurakartaNTupleWeightHeader {
+    param([string]$Path)
+
+    if (-not (Test-Path $Path)) {
+        throw "Missing expected weight file: $Path"
+    }
+
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    $reader = [System.IO.BinaryReader]::new($stream)
+    try {
+        if ($stream.Length -lt 20) {
+            throw "Weight file is too small to contain an NTuple header: $Path"
+        }
+
+        $magic = $reader.ReadUInt32()
+        $version = $reader.ReadUInt16()
+        $reserved = $reader.ReadUInt16()
+        $tupleSetHash = $reader.ReadUInt64()
+        $weightCount = $reader.ReadUInt32()
+
+        return [pscustomobject]@{
+            magic = ('0x{0:X8}' -f $magic)
+            version = [int]$version
+            reserved = [int]$reserved
+            tuple_set_hash = ('0x{0:X16}' -f $tupleSetHash)
+            weight_count = [uint32]$weightCount
+        }
+    } finally {
+        $reader.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Test-SurakartaObjectProperty {
+    param(
+        [object]$Value,
+        [string]$Name
+    )
+
+    return $null -ne ($Value.PSObject.Properties[$Name])
+}
+
+function Assert-SurakartaWeightManifestTraceable {
+    param(
+        [object]$Manifest,
+        [string]$Label = 'weight manifest'
+    )
+
+    foreach ($field in @('git_commit', 'checkpoint', 'binary_sha256')) {
+        if (-not (Test-SurakartaObjectProperty -Value $Manifest -Name $field)) {
+            throw "$Label is missing required traceability field '$field'."
+        }
+        if ($null -eq $Manifest.$field) {
+            throw "$Label has null required traceability field '$field'."
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$Manifest.git_commit)) {
+        throw "$Label has empty required traceability field 'git_commit'."
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$Manifest.binary_sha256)) {
+        throw "$Label has empty required traceability field 'binary_sha256'."
+    }
+}
+
+function New-SurakartaWeightManifest {
+    param(
+        [string]$RepoRoot,
+        [string]$WeightPath,
+        [string]$ArtifactKind,
+        [int]$Seed,
+        [int]$Games,
+        [int]$Depth,
+        [double]$Alpha,
+        [double]$Lambda,
+        [double]$Epsilon,
+        [int]$EpsilonPlies,
+        [double]$TerminalReward = 1200.0,
+        [double]$TdErrorClip = 0.0,
+        [int]$TerminalOnlyWarmup = 0,
+        [int]$NearTerminalCurriculum = 0,
+        [int]$CheckpointEvery,
+        [object]$Checkpoint
+    )
+
+    $fullWeightPath = [System.IO.Path]::GetFullPath($WeightPath)
+    $header = Get-SurakartaNTupleWeightHeader -Path $fullWeightPath
+    $checkpointValue = if ($null -ne $Checkpoint) {
+        $Checkpoint
+    } else {
+        [ordered]@{
+            is_checkpoint = $false
+            name = $null
+            games_completed = $null
+        }
+    }
+
+    $manifest = [ordered]@{
+        manifest_version = 1
+        artifact_kind = $ArtifactKind
+        git_commit = Get-SurakartaGitCommit -RepoRoot $RepoRoot
+        weights_path = $fullWeightPath
+        weights_relative_path = [System.IO.Path]::GetRelativePath($RepoRoot, $fullWeightPath)
+        seed = $Seed
+        games = $Games
+        depth = $Depth
+        alpha = $Alpha
+        lambda = $Lambda
+        epsilon = $Epsilon
+        epsilon_plies = $EpsilonPlies
+        terminal_reward = $TerminalReward
+        td_error_clip = $TdErrorClip
+        terminal_only_warmup = $TerminalOnlyWarmup
+        near_terminal_curriculum = $NearTerminalCurriculum
+        checkpoint_every = $CheckpointEvery
+        checkpoint = $checkpointValue
+        tuple_set_hash = $header.tuple_set_hash
+        weight_count = [int]$header.weight_count
+        binary_sha256 = Get-SurakartaFileSha256 -Path $fullWeightPath
+    }
+
+    Assert-SurakartaWeightManifestTraceable -Manifest ([pscustomobject]$manifest) -Label "$ArtifactKind manifest"
+    return $manifest
+}
+
+function Write-SurakartaWeightManifest {
+    param(
+        [string]$RepoRoot,
+        [string]$WeightPath,
+        [string]$ArtifactKind,
+        [int]$Seed,
+        [int]$Games,
+        [int]$Depth,
+        [double]$Alpha,
+        [double]$Lambda,
+        [double]$Epsilon,
+        [int]$EpsilonPlies,
+        [double]$TerminalReward = 1200.0,
+        [double]$TdErrorClip = 0.0,
+        [int]$TerminalOnlyWarmup = 0,
+        [int]$NearTerminalCurriculum = 0,
+        [int]$CheckpointEvery,
+        [object]$Checkpoint
+    )
+
+    $manifest = New-SurakartaWeightManifest -RepoRoot $RepoRoot `
+        -WeightPath $WeightPath `
+        -ArtifactKind $ArtifactKind `
+        -Seed $Seed `
+        -Games $Games `
+        -Depth $Depth `
+        -Alpha $Alpha `
+        -Lambda $Lambda `
+        -Epsilon $Epsilon `
+        -EpsilonPlies $EpsilonPlies `
+        -TerminalReward $TerminalReward `
+        -TdErrorClip $TdErrorClip `
+        -TerminalOnlyWarmup $TerminalOnlyWarmup `
+        -NearTerminalCurriculum $NearTerminalCurriculum `
+        -CheckpointEvery $CheckpointEvery `
+        -Checkpoint $Checkpoint
+    $manifestPath = "$WeightPath.manifest.json"
+    $manifest | ConvertTo-Json -Depth 8 | Set-Content -Path $manifestPath
+    return [pscustomobject]@{
+        Path = $manifestPath
+        Manifest = [pscustomobject]$manifest
+    }
+}
+
+function Write-SurakartaSessionWeightManifest {
+    param(
+        [string]$RepoRoot,
+        [string]$Path,
+        [string]$Purpose,
+        [object[]]$Artifacts
+    )
+
+    $manifest = [ordered]@{
+        manifest_version = 1
+        purpose = $Purpose
+        git_commit = Get-SurakartaGitCommit -RepoRoot $RepoRoot
+        artifacts = @($Artifacts | ForEach-Object { $_.Manifest })
+    }
+    $manifest | ConvertTo-Json -Depth 10 | Set-Content -Path $Path
+    return [pscustomobject]$manifest
+}
+
 function Get-SurakartaWorkspaceProcesses {
     param([string]$WorkspaceRoot = (Get-SurakartaRepoRoot))
 
