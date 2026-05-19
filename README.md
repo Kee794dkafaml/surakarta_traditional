@@ -44,6 +44,18 @@ pwsh ./scripts/benchmark-select.ps1
 - `benchmark-select.ps1` is the multi-seed observation gate. It runs several training seeds, stores per-seed `bootstrap.bin`, `candidate.bin`, and `bitboard-eval` reports under `build-local/training/<timestamp>/selection/seed-<seed>/`, and emits `selection-summary.json` / `selection-summary.txt` plus per-seed and session `weights-manifest.json` files for pass/watch/regress scorecards.
 - Until the baseline snapshot, manual rule acceptance, and TD/self-play smoke gate all pass on fresh artifacts, Phase 4B checkpoint ranking and extended benchmark selection stay frozen.
 
+### GUI match preset
+
+The GUI human-vs-engine default is the school match preset: `Depth 10` and `Threads 10`. This is only a GUI match configuration, not a training setting, not a selection gate setting, and not a Phase 4 checkpoint.
+
+The post-fix preset calibration summary is:
+
+- `D10/T10` global average search time is about `0.482s`, with max about `1.975s`.
+- Hard-position max is about `1.783s`.
+- `Threads=12` did not show stable benefit.
+- `Depth=4` is a debug preset and is not suitable as the match default.
+- This calibration record is not a Phase 3 trend pass signal.
+
 ### Benchmark CLI
 
 `surakarta-benchmark` keeps text output by default and now also supports structured JSON output:

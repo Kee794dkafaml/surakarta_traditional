@@ -7,7 +7,6 @@
 #include <optional>
 #include <sstream>
 #include <string>
-#include <thread>
 
 #include <GLFW/glfw3.h>
 
@@ -34,11 +33,64 @@ constexpr float kBoardLabelPaddingSteps = 0.55f;
 constexpr float kBoardGridSpanSteps = 5.0f;
 constexpr float kBoardVisualSpanSteps = kBoardGridSpanSteps + kBoardOuterTrackPaddingSteps * 2.0f;
 constexpr float kBoardPanelSpanSteps = kBoardVisualSpanSteps + kBoardLabelPaddingSteps * 2.0f;
+// GUI-only school match preset; training and selection gates keep their own settings.
+constexpr int kMatchPresetDepth = 10;
+constexpr int kMatchPresetThreads = 10;
+constexpr const char* kSearchSettingsTooltip = "Applies to next engine search";
 
-int DefaultThreadCount() {
-    const auto hardware_threads = std::thread::hardware_concurrency();
-    const auto suggested = hardware_threads == 0 ? 1u : std::max(1u, hardware_threads / 2);
-    return static_cast<int>(suggested);
+enum class GuiSearchPreset {
+    Fast,
+    Match,
+    Analysis,
+    Custom,
+};
+
+struct GuiSearchPresetConfig {
+    GuiSearchPreset preset;
+    const char* label;
+    int depth;
+    int threads;
+};
+
+constexpr auto kGuiSearchPresets = std::array<GuiSearchPresetConfig, 3>{
+    GuiSearchPresetConfig{GuiSearchPreset::Fast, "Fast", 8, 8},
+    GuiSearchPresetConfig{GuiSearchPreset::Match, "Match", kMatchPresetDepth, kMatchPresetThreads},
+    GuiSearchPresetConfig{GuiSearchPreset::Analysis, "Analysis", 10, 10},
+};
+
+const char* GuiSearchPresetLabel(GuiSearchPreset preset) {
+    switch (preset) {
+        case GuiSearchPreset::Fast:
+            return "Fast";
+        case GuiSearchPreset::Match:
+            return "Match";
+        case GuiSearchPreset::Analysis:
+            return "Analysis";
+        case GuiSearchPreset::Custom:
+            return "Custom";
+    }
+    return "Custom";
+}
+
+const GuiSearchPresetConfig* FindGuiSearchPreset(GuiSearchPreset preset) {
+    for (const auto& config : kGuiSearchPresets) {
+        if (config.preset == preset) {
+            return &config;
+        }
+    }
+    return nullptr;
+}
+
+bool SearchSettingsEditable(bool search_active) {
+    return !search_active;
+}
+
+bool SearchStatsOpenByDefault() {
+    return false;
+}
+
+bool DefaultSidebarShowsProfilerMetrics() {
+    return SearchStatsOpenByDefault();
 }
 
 struct StartupOptions {
@@ -48,8 +100,9 @@ struct StartupOptions {
     bool smoke_test_coordinate_convention{false};
     bool smoke_test_sidebar_labels{false};
     std::string file_name;
-    int depth{4};
-    int threads{DefaultThreadCount()};
+    GuiSearchPreset preset{GuiSearchPreset::Match};
+    int depth{kMatchPresetDepth};
+    int threads{kMatchPresetThreads};
     Color human_color{Color::Black};
 };
 
@@ -93,8 +146,9 @@ struct ArcSweep {
 };
 
 struct SidebarState {
-    int depth{4};
-    int threads{1};
+    GuiSearchPreset preset{GuiSearchPreset::Match};
+    int depth{kMatchPresetDepth};
+    int threads{kMatchPresetThreads};
     Color human_color{Color::Black};
     char file_name[512]{};
     std::string status_message;
@@ -105,6 +159,14 @@ void ApplySearchSettings(DevelopmentSession& session, const SidebarState& state)
     limits.max_depth = std::max(1, state.depth);
     limits.threads = std::max(1, state.threads);
     session.SetSearchLimits(limits);
+}
+
+void ApplyGuiSearchPreset(SidebarState& sidebar, GuiSearchPreset preset) {
+    sidebar.preset = preset;
+    if (const auto* config = FindGuiSearchPreset(preset)) {
+        sidebar.depth = config->depth;
+        sidebar.threads = config->threads;
+    }
 }
 
 const char* ColorLabel(Color color) {
@@ -197,7 +259,7 @@ SidebarMoveDisplay BuildSidebarMoveDisplay(const surakarta::bitboard::Position& 
     const bool snapshot_is_current_search = snapshot.active || is_engine_turn;
     auto display = SidebarMoveDisplay{};
     if (snapshot_is_current_search) {
-        display.label = "Best Move";
+        display.label = "Thinking";
         display.move_text = FormatMove(snapshot.best_move);
         display.pv_text = FormatPrincipalVariation(position, snapshot.pv, snapshot.pv_length);
         display.path_text = FormatPath(CapturePathForMove(position, snapshot.best_move));
@@ -211,10 +273,9 @@ SidebarMoveDisplay BuildSidebarMoveDisplay(const surakarta::bitboard::Position& 
         return display;
     }
 
-    display.label = "Best Move";
-    display.move_text = FormatMove(snapshot.best_move);
-    display.pv_text = FormatPrincipalVariation(position, snapshot.pv, snapshot.pv_length);
-    display.path_text = FormatPath(CapturePathForMove(position, snapshot.best_move));
+    display.label = "Last Move";
+    display.move_text = "n/a";
+    display.pv_text = "n/a";
     return display;
 }
 
@@ -414,6 +475,9 @@ int RunCoordinateConventionSmoke() {
 }
 
 int RunSidebarLabelSmoke() {
+    const auto default_options = StartupOptions{};
+    const auto default_sidebar = SidebarState{};
+
     auto position = surakarta::bitboard::Position{};
     position.board.SetPiece(Color::Black, MakeSquare(2, 3));
     position.board.SetPiece(Color::White, MakeSquare(2, 1));
@@ -432,6 +496,37 @@ int RunSidebarLabelSmoke() {
     };
 
     auto okay = true;
+    if (default_options.depth != 10 || default_options.threads != 10 ||
+        default_sidebar.depth != 10 || default_sidebar.threads != 10) {
+        std::fputs("surakarta-gui sidebar smoke failed: GUI defaults must use Match preset depth 10 threads 10\n", stderr);
+        okay = false;
+    }
+    if (default_sidebar.preset != GuiSearchPreset::Match) {
+        std::fputs("surakarta-gui sidebar smoke failed: GUI default preset must be Match\n", stderr);
+        okay = false;
+    }
+    if (SearchStatsOpenByDefault()) {
+        std::fputs("surakarta-gui sidebar smoke failed: Debug / Search Stats must be collapsed by default\n", stderr);
+        okay = false;
+    }
+    if (SearchSettingsEditable(true) || !SearchSettingsEditable(false)) {
+        std::fputs("surakarta-gui sidebar smoke failed: Depth and Threads must be disabled while AI is thinking\n", stderr);
+        okay = false;
+    }
+    if (DefaultSidebarShowsProfilerMetrics()) {
+        std::fputs("surakarta-gui sidebar smoke failed: profiler metrics must not be visible in the default sidebar\n", stderr);
+        okay = false;
+    }
+
+    const auto empty_display =
+        BuildSidebarMoveDisplay(position, surakarta::bitboard::SearchSnapshot{}, false, std::nullopt, {});
+    if (empty_display.label != "Last Move" ||
+        empty_display.move_text != "n/a" ||
+        empty_display.pv_text != "n/a") {
+        std::fputs("surakarta-gui sidebar smoke failed: missing search results must display n/a instead of stale best moves\n", stderr);
+        okay = false;
+    }
+
     const auto completed_display =
         BuildSidebarMoveDisplay(position, snapshot, false, last_move, last_path);
     if (completed_display.label != "Last Move" ||
@@ -444,10 +539,10 @@ int RunSidebarLabelSmoke() {
     snapshot.active = true;
     const auto active_display =
         BuildSidebarMoveDisplay(position, snapshot, false, last_move, last_path);
-    if (active_display.label != "Best Move" ||
+    if (active_display.label != "Thinking" ||
         active_display.move_text != "(2, 3) -> (2, 1) x" ||
-        active_display.pv_text.empty()) {
-        std::fputs("surakarta-gui sidebar smoke failed: active searches must show Best Move/PV\n", stderr);
+        active_display.pv_text != "(2, 3) -> (2, 1) x") {
+        std::fputs("surakarta-gui sidebar smoke failed: active searches must show Thinking/PV\n", stderr);
         okay = false;
     }
 
@@ -595,33 +690,74 @@ void RenderBoard(DevelopmentSession& session,
     }
 }
 
+void DrawSearchSettingsTooltip() {
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("%s", kSearchSettingsTooltip);
+    }
+}
+
 void RenderSidebar(DevelopmentSession& session,
                    SidebarState& sidebar,
                    const std::optional<LegalTargetInfo>& hovered_target_info) {
     const auto snapshot = session.SearchSnapshot();
+    const auto search_active = session.SearchActive();
     const auto eval_score = snapshot.active ? snapshot.score : session.EvalScore();
     const auto status = session.Status();
     const auto& position = session.Position();
 
     ImGui::Text("Side To Move: %s", ColorLabel(position.SideToMove()));
     ImGui::Text("Human Side: %s", ColorLabel(session.HumanColor()));
-    ImGui::Text("Engine State: %s", session.SearchActive() ? "thinking" : "idle");
+    ImGui::Text("Engine State: %s", search_active ? "thinking" : "idle");
     if (status.terminal) {
         ImGui::TextColored(ImVec4(0.82f, 0.30f, 0.18f, 1.0f),
                            "Game Ended: %s",
                            SurakartaToString(status.end_reason).c_str());
     }
 
+    const bool settings_editable = SearchSettingsEditable(search_active);
+    if (!settings_editable) {
+        ImGui::BeginDisabled();
+    }
+    if (ImGui::BeginCombo("Preset", GuiSearchPresetLabel(sidebar.preset))) {
+        for (const auto& config : kGuiSearchPresets) {
+            const bool selected = sidebar.preset == config.preset;
+            if (ImGui::Selectable(config.label, selected)) {
+                ApplyGuiSearchPreset(sidebar, config.preset);
+                ApplySearchSettings(session, sidebar);
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        const bool custom_selected = sidebar.preset == GuiSearchPreset::Custom;
+        if (ImGui::Selectable("Custom", custom_selected)) {
+            sidebar.preset = GuiSearchPreset::Custom;
+        }
+        if (custom_selected) {
+            ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+
     int depth = sidebar.depth;
     if (ImGui::InputInt("Depth", &depth)) {
         sidebar.depth = std::max(1, depth);
+        sidebar.preset = GuiSearchPreset::Custom;
         ApplySearchSettings(session, sidebar);
     }
+    DrawSearchSettingsTooltip();
 
     int threads = sidebar.threads;
     if (ImGui::InputInt("Threads", &threads)) {
         sidebar.threads = std::max(1, threads);
+        sidebar.preset = GuiSearchPreset::Custom;
         ApplySearchSettings(session, sidebar);
+    }
+    DrawSearchSettingsTooltip();
+    if (!settings_editable) {
+        ImGui::EndDisabled();
     }
 
     const int current_color = sidebar.human_color == Color::Black ? 0 : 1;
@@ -672,61 +808,69 @@ void RenderSidebar(DevelopmentSession& session,
         ImGui::TextWrapped("%s", sidebar.status_message.c_str());
     }
 
-    ImGui::Separator();
-    ImGui::Text("Zobrist: 0x%016llX", static_cast<unsigned long long>(position.zobrist_key));
-    ImGui::Text("Eval: %d", eval_score);
-    ImGui::Text("Depth: %d", snapshot.depth);
-    ImGui::Text("Nodes: %llu", static_cast<unsigned long long>(snapshot.nodes));
-    ImGui::Text("QNodes: %llu", static_cast<unsigned long long>(snapshot.qnodes));
-    ImGui::Text("NPS: %llu", static_cast<unsigned long long>(snapshot.nps));
-    ImGui::Text("TT Hits: %llu", static_cast<unsigned long long>(snapshot.tt_hits));
-    ImGui::Text("Null Prunes: %llu", static_cast<unsigned long long>(snapshot.null_prunes));
-    ImGui::Text("LMR Reductions: %llu", static_cast<unsigned long long>(snapshot.lmr_reductions));
-    ImGui::Text("Fail-High: %llu", static_cast<unsigned long long>(snapshot.fail_highs));
-    ImGui::Text("Fail-Low: %llu", static_cast<unsigned long long>(snapshot.fail_lows));
-    ImGui::Text("Aspiration Retries: %llu", static_cast<unsigned long long>(snapshot.aspiration_retries));
-    ImGui::Text("Aspiration Attempts: %llu", static_cast<unsigned long long>(snapshot.aspiration_attempts));
-    ImGui::Text("Full-Window Re-searches: %llu", static_cast<unsigned long long>(snapshot.full_window_researches));
-    ImGui::Text("Root Best Updates: %llu", static_cast<unsigned long long>(snapshot.root_best_updates));
-    ImGui::Text("TT Exact Cutoffs: %llu", static_cast<unsigned long long>(snapshot.tt_exact_cutoffs));
-    ImGui::Text("TT Bound Cutoffs: %llu", static_cast<unsigned long long>(snapshot.tt_bound_cutoffs));
-    ImGui::Text("Beta Cutoffs: %llu", static_cast<unsigned long long>(snapshot.beta_cutoffs));
-    ImGui::Text("Stale Root Tasks: %llu", static_cast<unsigned long long>(snapshot.stale_root_tasks));
-    ImGui::Text("Aborted Root Tasks: %llu", static_cast<unsigned long long>(snapshot.aborted_root_tasks));
-    ImGui::Text("Worker Idle Spins: %llu", static_cast<unsigned long long>(snapshot.worker_idle_spins));
-    ImGui::Text("Thread Spawns: %llu", static_cast<unsigned long long>(snapshot.thread_spawn_count));
     const auto move_display = BuildSidebarMoveDisplay(position,
                                                       snapshot,
                                                       session.IsEngineTurn(),
                                                       session.LastMove(),
                                                       session.LastMovePath());
     ImGui::Text("%s: %s", move_display.label.c_str(), move_display.move_text.c_str());
-    if (!move_display.pv_text.empty()) {
+    if (move_display.label == "Thinking") {
         ImGui::TextWrapped("PV: %s", move_display.pv_text.c_str());
     }
     if (!move_display.path_text.empty()) {
         ImGui::TextWrapped("%s Path: %s", move_display.label.c_str(), move_display.path_text.c_str());
     }
 
-    if (session.SelectedSquare().has_value()) {
+    const auto search_stats_flags = SearchStatsOpenByDefault() ? ImGuiTreeNodeFlags_DefaultOpen : ImGuiTreeNodeFlags_None;
+    if (ImGui::CollapsingHeader("Debug / Search Stats", search_stats_flags)) {
         ImGui::Separator();
-        ImGui::Text("Selected: %s", FormatSquare(*session.SelectedSquare()).c_str());
-        for (const auto& target : session.LegalTargets()) {
-            ImGui::BulletText("%s %s%s",
-                              FormatSquare(target.to).c_str(),
-                              target.IsCapture() ? "capture" : "quiet",
-                              target.IsCapture()
-                                  ? (" (" + std::to_string(target.variant_count) + " variants)").c_str()
-                                  : "");
-        }
-    }
+        ImGui::Text("%s", search_active ? "Current Engine Search" : "Last Engine Search");
+        ImGui::Text("Zobrist: 0x%016llX", static_cast<unsigned long long>(position.zobrist_key));
+        ImGui::Text("Eval: %d", eval_score);
+        ImGui::Text("Depth: %d", snapshot.depth);
+        ImGui::Text("Nodes: %llu", static_cast<unsigned long long>(snapshot.nodes));
+        ImGui::Text("QNodes: %llu", static_cast<unsigned long long>(snapshot.qnodes));
+        ImGui::Text("NPS: %llu", static_cast<unsigned long long>(snapshot.nps));
+        ImGui::Text("TT Hits: %llu", static_cast<unsigned long long>(snapshot.tt_hits));
+        ImGui::Text("Null Prunes: %llu", static_cast<unsigned long long>(snapshot.null_prunes));
+        ImGui::Text("LMR Reductions: %llu", static_cast<unsigned long long>(snapshot.lmr_reductions));
+        ImGui::Text("Fail-High: %llu", static_cast<unsigned long long>(snapshot.fail_highs));
+        ImGui::Text("Fail-Low: %llu", static_cast<unsigned long long>(snapshot.fail_lows));
+        ImGui::Text("Aspiration Retries: %llu", static_cast<unsigned long long>(snapshot.aspiration_retries));
+        ImGui::Text("Aspiration Attempts: %llu", static_cast<unsigned long long>(snapshot.aspiration_attempts));
+        ImGui::Text("Full-Window Re-searches: %llu", static_cast<unsigned long long>(snapshot.full_window_researches));
+        ImGui::Text("Root Best Updates: %llu", static_cast<unsigned long long>(snapshot.root_best_updates));
+        ImGui::Text("TT Exact Cutoffs: %llu", static_cast<unsigned long long>(snapshot.tt_exact_cutoffs));
+        ImGui::Text("TT Bound Cutoffs: %llu", static_cast<unsigned long long>(snapshot.tt_bound_cutoffs));
+        ImGui::Text("Beta Cutoffs: %llu", static_cast<unsigned long long>(snapshot.beta_cutoffs));
+        ImGui::Text("Stale Root Tasks: %llu", static_cast<unsigned long long>(snapshot.stale_root_tasks));
+        ImGui::Text("Aborted Root Tasks: %llu", static_cast<unsigned long long>(snapshot.aborted_root_tasks));
+        ImGui::Text("Worker Idle Spins: %llu", static_cast<unsigned long long>(snapshot.worker_idle_spins));
+        ImGui::Text("Thread Spawns: %llu", static_cast<unsigned long long>(snapshot.thread_spawn_count));
+        ImGui::Text("Best Move: %s", FormatMove(snapshot.best_move).c_str());
+        ImGui::TextWrapped("PV: %s", FormatPrincipalVariation(position, snapshot.pv, snapshot.pv_length).c_str());
 
-    if (hovered_target_info.has_value()) {
-        ImGui::Separator();
-        ImGui::Text("Hover Target: %s", FormatSquare(hovered_target_info->to).c_str());
-        ImGui::Text("Path Variants: %u", hovered_target_info->variant_count);
-        ImGui::Text("Displayed Variant: %u", hovered_target_info->primary_variant);
-        ImGui::Text("Path Segments: %d", static_cast<int>(session.HoverPath().size()));
+        if (session.SelectedSquare().has_value()) {
+            ImGui::Separator();
+            ImGui::Text("Selected: %s", FormatSquare(*session.SelectedSquare()).c_str());
+            for (const auto& target : session.LegalTargets()) {
+                const auto variant_text = target.IsCapture()
+                                              ? " (" + std::to_string(target.variant_count) + " variants)"
+                                              : std::string{};
+                ImGui::BulletText("%s %s%s",
+                                  FormatSquare(target.to).c_str(),
+                                  target.IsCapture() ? "capture" : "quiet",
+                                  variant_text.c_str());
+            }
+        }
+
+        if (hovered_target_info.has_value()) {
+            ImGui::Separator();
+            ImGui::Text("Hover Target: %s", FormatSquare(hovered_target_info->to).c_str());
+            ImGui::Text("Path Variants: %u", hovered_target_info->variant_count);
+            ImGui::Text("Displayed Variant: %u", hovered_target_info->primary_variant);
+            ImGui::Text("Path Segments: %d", static_cast<int>(session.HoverPath().size()));
+        }
     }
 }
 
@@ -748,8 +892,10 @@ StartupOptions ParseArgs(int argc, char** argv) {
             options.file_name = argv[++i];
         } else if ((arg == "--depth" || arg == "-d") && i + 1 < argc) {
             options.depth = std::max(1, std::atoi(argv[++i]));
+            options.preset = GuiSearchPreset::Custom;
         } else if ((arg == "--threads" || arg == "-j") && i + 1 < argc) {
             options.threads = std::max(1, std::atoi(argv[++i]));
+            options.preset = GuiSearchPreset::Custom;
         } else if ((arg == "--human" || arg == "-h") && i + 1 < argc) {
             const auto value = std::string(argv[++i]);
             if (value == "white" || value == "W") {
@@ -847,6 +993,7 @@ int main(int argc, char** argv) {
 
     auto session = DevelopmentSession{};
     auto sidebar = SidebarState{};
+    sidebar.preset = options.preset;
     sidebar.depth = options.depth;
     sidebar.threads = options.threads;
     sidebar.human_color = options.human_color;
