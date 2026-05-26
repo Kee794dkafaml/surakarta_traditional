@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -78,6 +79,78 @@ void AtomicMax(std::atomic<int>& target, int value) {
                                          std::memory_order_relaxed,
                                          std::memory_order_relaxed)) {
     }
+}
+
+void SetSkeletonError(ActiveObjectiveConfigSkeleton* config,
+                      std::string* error_message,
+                      const std::string& message) {
+    if (config != nullptr) {
+        config->config_present = true;
+        config->default_off = true;
+        config->config_valid = false;
+        config->skeleton_enabled = false;
+        config->probe_wiring_skeleton = false;
+        config->no_output_probe_mode = false;
+        config->weight_artifact_suppressed = false;
+        config->active_objective_probe_executed = false;
+        config->selection_gate_eligible = false;
+        config->reject_reason = message;
+    }
+    if (error_message != nullptr) {
+        *error_message = message;
+    }
+}
+
+bool ContainsJsonLiteral(const std::string& text, const std::string& key, const std::string& value) {
+    const auto key_pos = text.find("\"" + key + "\"");
+    if (key_pos == std::string::npos) {
+        return false;
+    }
+    const auto colon = text.find(':', key_pos);
+    if (colon == std::string::npos) {
+        return false;
+    }
+    auto value_pos = colon + 1;
+    while (value_pos < text.size() &&
+           (text[value_pos] == ' ' || text[value_pos] == '\n' || text[value_pos] == '\r' || text[value_pos] == '\t')) {
+        ++value_pos;
+    }
+    return text.compare(value_pos, value.size(), value) == 0;
+}
+
+bool ContainsJsonString(const std::string& text, const std::string& key, const std::string& value) {
+    return ContainsJsonLiteral(text, key, "\"" + value + "\"");
+}
+
+bool ExtractJsonDouble(const std::string& text, const std::string& key, double* value) {
+    const auto key_pos = text.find("\"" + key + "\"");
+    if (key_pos == std::string::npos) {
+        return false;
+    }
+    const auto colon = text.find(':', key_pos);
+    if (colon == std::string::npos) {
+        return false;
+    }
+    const auto start = text.find_first_of("-0123456789", colon + 1);
+    if (start == std::string::npos) {
+        return false;
+    }
+    char* end = nullptr;
+    const auto parsed = std::strtod(text.c_str() + start, &end);
+    if (end == text.c_str() + start) {
+        return false;
+    }
+    *value = parsed;
+    return true;
+}
+
+bool ExtractJsonInt(const std::string& text, const std::string& key, int* value) {
+    double parsed = 0.0;
+    if (!ExtractJsonDouble(text, key, &parsed)) {
+        return false;
+    }
+    *value = static_cast<int>(parsed);
+    return std::abs(parsed - static_cast<double>(*value)) < 0.000001;
 }
 
 }  // namespace
@@ -2187,15 +2260,104 @@ EvalMatchGame PlayEvaluationMatchGame(const std::string& case_id,
 
 }  // namespace
 
+bool ParseActiveObjectiveConfigSkeleton(const std::string& text,
+                                        ActiveObjectiveConfigSkeleton* config,
+                                        std::string* error_message) {
+    if (config == nullptr) {
+        if (error_message != nullptr) {
+            *error_message = "active objective config output is required";
+        }
+        return false;
+    }
+
+    *config = ActiveObjectiveConfigSkeleton{};
+    config->config_present = true;
+    config->default_off = true;
+    config->active_objective_probe_executed = false;
+    config->selection_gate_eligible = false;
+
+    if (!ContainsJsonLiteral(text, "schema_version", "1")) {
+        SetSkeletonError(config, error_message, "active objective config schema_version must be 1");
+        return false;
+    }
+    if (ContainsJsonLiteral(text, "enabled", "false")) {
+        config->config_valid = true;
+        config->reject_reason = "disabled config keeps default-off skeleton inactive";
+        if (error_message != nullptr) {
+            error_message->clear();
+        }
+        return true;
+    }
+    if (!ContainsJsonLiteral(text, "enabled", "true")) {
+        SetSkeletonError(config, error_message, "active objective config must set enabled true or false");
+        return false;
+    }
+    if (!ContainsJsonString(text, "mode", "active_scoped")) {
+        SetSkeletonError(config, error_message, "active objective config mode must be active_scoped");
+        return false;
+    }
+    if (!ContainsJsonString(text, "scope", "opening_root_children_only")) {
+        SetSkeletonError(config, error_message, "active objective config scope must be opening_root_children_only");
+        return false;
+    }
+    if (!ContainsJsonLiteral(text, "report_only", "true")) {
+        SetSkeletonError(config, error_message, "active objective config must be report_only");
+        return false;
+    }
+    if (!ContainsJsonLiteral(text, "selection_gate_eligible", "false")) {
+        SetSkeletonError(config, error_message, "active objective config must keep selection_gate_eligible false");
+        return false;
+    }
+    const bool probe_only = ContainsJsonLiteral(text, "probe_only", "true");
+    const bool no_output_weights = ContainsJsonLiteral(text, "no_output_weights", "true");
+    if (no_output_weights && !probe_only) {
+        SetSkeletonError(config, error_message, "no_output_weights requires probe_only");
+        return false;
+    }
+
+    double weight = 0.0;
+    if (!ExtractJsonDouble(text, "opening_drift_penalty_weight", &weight) || weight <= 0.0 || weight > 0.01) {
+        SetSkeletonError(config, error_message, "active objective config weight must be in (0, 0.01]");
+        return false;
+    }
+    int max_games = 0;
+    if (!ExtractJsonInt(text, "max_games", &max_games) || max_games < 1 || max_games > 4) {
+        SetSkeletonError(config, error_message, "active objective config max_games must be in [1, 4]");
+        return false;
+    }
+    int max_depth = 0;
+    if (!ExtractJsonInt(text, "max_depth", &max_depth) || max_depth < 1 || max_depth > 4) {
+        SetSkeletonError(config, error_message, "active objective config max_depth must be in [1, 4]");
+        return false;
+    }
+    if (text.find("20260423") == std::string::npos) {
+        SetSkeletonError(config, error_message, "active objective config seed_allowlist must include 20260423");
+        return false;
+    }
+
+    config->config_valid = true;
+    config->skeleton_enabled = true;
+    config->scoped_config = true;
+    config->probe_wiring_skeleton = probe_only;
+    config->no_output_probe_mode = probe_only && no_output_weights;
+    config->weight_artifact_suppressed = config->no_output_probe_mode;
+    config->mode = "active_scoped";
+    config->scope = "opening_root_children_only";
+    config->opening_drift_penalty_weight = weight;
+    config->max_games = max_games;
+    config->max_depth = max_depth;
+    config->seed = 20260423;
+    if (error_message != nullptr) {
+        error_message->clear();
+    }
+    return true;
+}
+
 bool RunBitboardTraining(const TrainingOptions& options,
                          TrainingSummary* summary,
                          std::string* error_message) {
     if (summary != nullptr) {
         *summary = TrainingSummary{};
-    }
-    if (options.output_weights_path.empty()) {
-        SetErrorMessage(error_message, "output weight path is required");
-        return false;
     }
     if (options.games < 0) {
         SetErrorMessage(error_message, "game count must be non-negative");
@@ -2215,6 +2377,16 @@ bool RunBitboardTraining(const TrainingOptions& options,
     }
     if (options.near_terminal_curriculum < 0) {
         SetErrorMessage(error_message, "near-terminal curriculum must be non-negative");
+        return false;
+    }
+    if (options.active_objective_config.config_present && !options.active_objective_config.config_valid) {
+        SetErrorMessage(error_message,
+                        "active objective config rejected: " + options.active_objective_config.reject_reason);
+        return false;
+    }
+    const bool no_output_probe_mode = options.active_objective_config.no_output_probe_mode;
+    if (options.output_weights_path.empty() && !no_output_probe_mode) {
+        SetErrorMessage(error_message, "output weight path is required");
         return false;
     }
 
@@ -2239,6 +2411,50 @@ bool RunBitboardTraining(const TrainingOptions& options,
         local_summary.terminal_only_warmup = options.terminal_only_warmup;
         local_summary.near_terminal_curriculum = options.near_terminal_curriculum;
         local_summary.output_weights_path = options.output_weights_path;
+        local_summary.active_interface_config_present = options.active_objective_config.config_present;
+        local_summary.active_interface_config_valid = options.active_objective_config.config_valid;
+        local_summary.active_interface_skeleton_enabled = options.active_objective_config.skeleton_enabled;
+        local_summary.active_interface_scoped_config = options.active_objective_config.scoped_config;
+        local_summary.active_interface_probe_wiring_skeleton =
+            options.active_objective_config.probe_wiring_skeleton;
+        local_summary.active_interface_no_output_probe_mode =
+            options.active_objective_config.no_output_probe_mode;
+        local_summary.active_interface_weight_artifact_suppressed =
+            options.active_objective_config.weight_artifact_suppressed;
+        local_summary.active_interface_report_only_probe_path =
+            options.active_objective_config.scoped_config &&
+            options.active_objective_config.no_output_probe_mode &&
+            options.active_objective_config.weight_artifact_suppressed;
+        local_summary.active_objective_probe_executed =
+            local_summary.active_interface_report_only_probe_path &&
+            options.active_objective_config.config_valid &&
+            !options.active_objective_config.selection_gate_eligible;
+        local_summary.selection_gate_eligible = false;
+        if (local_summary.active_objective_probe_executed) {
+            local_summary.active_interface_config_status =
+                "report_only_objective_diagnostic_executed_no_output";
+        } else if (local_summary.active_interface_report_only_probe_path) {
+            local_summary.active_interface_config_status =
+                "report_only_active_probe_path_implemented_no_execution";
+        } else if (options.active_objective_config.no_output_probe_mode) {
+            local_summary.active_interface_config_status =
+                "probe_wiring_skeleton_no_output_no_active_probe";
+        } else if (options.active_objective_config.probe_wiring_skeleton) {
+            local_summary.active_interface_config_status = "probe_wiring_skeleton_no_active_probe";
+        } else if (options.active_objective_config.skeleton_enabled) {
+            local_summary.active_interface_config_status = "skeleton_enabled_no_active_probe";
+        } else if (options.active_objective_config.config_present) {
+            local_summary.active_interface_config_status = "config_default_off";
+        } else {
+            local_summary.active_interface_config_status = "default_off";
+        }
+
+        if (no_output_probe_mode) {
+            if (summary != nullptr) {
+                *summary = local_summary;
+            }
+            return true;
+        }
 
         if (options.games == 0) {
             if (!weights.SaveBinary(options.output_weights_path)) {

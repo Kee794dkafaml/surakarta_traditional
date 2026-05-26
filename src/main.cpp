@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <random>
 #include <sstream>
@@ -293,6 +294,24 @@ std::string FormatDouble(double value) {
     auto stream = std::ostringstream{};
     stream << std::fixed << std::setprecision(6) << value;
     return stream.str();
+}
+
+std::string QuoteCommandPath(const std::filesystem::path& path) {
+    return "\"" + path.string() + "\"";
+}
+
+int RunBitboardSelftestCommand(const char* argv0) {
+    const auto benchmark_path = std::filesystem::absolute(std::filesystem::path(argv0));
+    const auto selftest_path = benchmark_path.parent_path() / "surakarta-bitboard-selftest.exe";
+    if (!std::filesystem::exists(selftest_path)) {
+        std::cerr << "bitboard-selftest failed: " << selftest_path.string() << " not found" << std::endl;
+        return 1;
+    }
+    return std::system(QuoteCommandPath(selftest_path).c_str());
+}
+
+const char* BoolJson(bool value) {
+    return value ? "true" : "false";
 }
 
 TraceOutputFormat ParseTraceOutputFormat(const std::string& value) {
@@ -851,6 +870,24 @@ void PrintTrainingSummary(const surakarta::bitboard::TrainingSummary& summary, O
                   << "\"max_abs_td_error\":" << FormatDouble(summary.max_abs_td_error) << ","
                   << "\"average_abs_weight_delta\":" << FormatDouble(summary.average_abs_weight_delta) << ","
                   << "\"max_abs_weight_delta\":" << FormatDouble(summary.max_abs_weight_delta) << ","
+                  << "\"active_interface_config_present\":" << BoolJson(summary.active_interface_config_present) << ","
+                  << "\"active_interface_config_valid\":" << BoolJson(summary.active_interface_config_valid) << ","
+                  << "\"active_interface_skeleton_enabled\":" << BoolJson(summary.active_interface_skeleton_enabled) << ","
+                  << "\"active_interface_scoped_config\":" << BoolJson(summary.active_interface_scoped_config) << ","
+                  << "\"active_interface_probe_wiring_skeleton\":"
+                  << BoolJson(summary.active_interface_probe_wiring_skeleton) << ","
+                  << "\"active_interface_no_output_probe_mode\":"
+                  << BoolJson(summary.active_interface_no_output_probe_mode) << ","
+                  << "\"active_interface_weight_artifact_suppressed\":"
+                  << BoolJson(summary.active_interface_weight_artifact_suppressed) << ","
+                  << "\"active_interface_report_only_probe_path\":"
+                  << BoolJson(summary.active_interface_report_only_probe_path) << ","
+                  << "\"active_objective_probe_executed\":"
+                  << BoolJson(summary.active_objective_probe_executed) << ","
+                  << "\"selection_gate_eligible\":" << BoolJson(summary.selection_gate_eligible) << ","
+                  << "\"active_interface_config_status\":\""
+                  << EscapeJsonString(summary.active_interface_config_status) << "\","
+
                   << "\"checkpoint_count\":" << summary.checkpoint_count << ","
                   << "\"checkpoint_summaries\":[";
         for (std::size_t i = 0; i < summary.checkpoint_summaries.size(); ++i) {
@@ -907,6 +944,22 @@ void PrintTrainingSummary(const surakarta::bitboard::TrainingSummary& summary, O
     std::cout << "max_abs_td_error: " << summary.max_abs_td_error << std::endl;
     std::cout << "average_abs_weight_delta: " << summary.average_abs_weight_delta << std::endl;
     std::cout << "max_abs_weight_delta: " << summary.max_abs_weight_delta << std::endl;
+    std::cout << "active_interface_config_present: " << BoolJson(summary.active_interface_config_present) << std::endl;
+    std::cout << "active_interface_config_valid: " << BoolJson(summary.active_interface_config_valid) << std::endl;
+    std::cout << "active_interface_skeleton_enabled: "
+              << BoolJson(summary.active_interface_skeleton_enabled) << std::endl;
+    std::cout << "active_interface_scoped_config: " << BoolJson(summary.active_interface_scoped_config) << std::endl;
+    std::cout << "active_interface_probe_wiring_skeleton: "
+              << BoolJson(summary.active_interface_probe_wiring_skeleton) << std::endl;
+    std::cout << "active_interface_no_output_probe_mode: "
+              << BoolJson(summary.active_interface_no_output_probe_mode) << std::endl;
+    std::cout << "active_interface_weight_artifact_suppressed: "
+              << BoolJson(summary.active_interface_weight_artifact_suppressed) << std::endl;
+    std::cout << "active_interface_report_only_probe_path: "
+              << BoolJson(summary.active_interface_report_only_probe_path) << std::endl;
+    std::cout << "active_objective_probe_executed: " << BoolJson(summary.active_objective_probe_executed) << std::endl;
+    std::cout << "selection_gate_eligible: " << BoolJson(summary.selection_gate_eligible) << std::endl;
+    std::cout << "active_interface_config_status: " << summary.active_interface_config_status << std::endl;
     std::cout << "checkpoint_count: " << summary.checkpoint_count << std::endl;
     for (const auto& checkpoint : summary.checkpoint_summaries) {
         std::cout << "checkpoint_summary: games_completed=" << checkpoint.games_completed
@@ -1437,6 +1490,24 @@ int RunBitboardTrainCommand(int argc, char** argv) {
                 return 1;
             }
             options.checkpoint_dir = argv[i];
+        } else if (strcmp(argv[i], "--config") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return 1;
+            }
+            options.active_objective_config_path = argv[i];
+            auto config_file = std::ifstream(options.active_objective_config_path);
+            if (!config_file) {
+                std::cerr << "failed to open config: " << options.active_objective_config_path << std::endl;
+                return 1;
+            }
+            auto config_stream = std::ostringstream{};
+            config_stream << config_file.rdbuf();
+            auto config_error = std::string{};
+            if (!surakarta::bitboard::ParseActiveObjectiveConfigSkeleton(
+                    config_stream.str(), &options.active_objective_config, &config_error)) {
+                std::cerr << "invalid config: " << config_error << std::endl;
+                return 1;
+            }
         } else if (strcmp(argv[i], "--format") == 0 || strcmp(argv[i], "-F") == 0) {
             if (!RequireValue(argc, argv, &i, argv[i - 0])) {
                 return 1;
@@ -1510,6 +1581,7 @@ void PrintUsage(const char* executable) {
     std::cout << "       " << executable << " bitboard-trace [--games|-g <n>] [--seed <n>] [--format json|csv]" << std::endl;
     std::cout << "       " << executable << " bitboard-train --output|-o <weights.bin> [args..]" << std::endl;
     std::cout << "       " << executable << " bitboard-eval --candidate <weights.bin> [args..]" << std::endl;
+    std::cout << "       " << executable << " bitboard-selftest" << std::endl;
     std::cout << "       " << executable << " statistic [args..] [-j <concurrency>] [-n <total_rounds>]" << std::endl;
     std::cout << "Args:" << std::endl;
     std::cout << "  --depth|-d <depth>  Search depth for bitboard commands, default: 4" << std::endl;
@@ -1522,8 +1594,9 @@ void PrintUsage(const char* executable) {
     std::cout << "  --case-id|-c <id>   Optional report case identifier, default: opening or file stem" << std::endl;
     std::cout << "  --search-diagnostics Enable root/aspiration/qsearch diagnostic output for bitboard search commands" << std::endl;
     std::cout << "  bitboard-trace args: --weights|-w --games|-g --alpha --lambda --epsilon --epsilon-plies --terminal-reward --td-error-clip --terminal-only-warmup --near-terminal-curriculum --seed --format json|csv" << std::endl;
-    std::cout << "  bitboard-train args: --weights|-w --games|-g --alpha --lambda --epsilon --epsilon-plies --terminal-reward --td-error-clip --terminal-only-warmup --near-terminal-curriculum --seed --checkpoint-every --checkpoint-dir" << std::endl;
+    std::cout << "  bitboard-train args: --weights|-w --games|-g --alpha --lambda --epsilon --epsilon-plies --terminal-reward --td-error-clip --terminal-only-warmup --near-terminal-curriculum --seed --checkpoint-every --checkpoint-dir --config" << std::endl;
     std::cout << "  bitboard-eval args: --baseline --depth|-d --format|-F" << std::endl;
+    std::cout << "  bitboard-selftest runs the bitboard selftest executable next to this benchmark binary" << std::endl;
 }
 
 int main(int argc, char** argv) {
@@ -1582,6 +1655,9 @@ int main(int argc, char** argv) {
     }
     if (command == "bitboard-eval") {
         return RunBitboardEvalCommand(argc - 2, argv + 2);
+    }
+    if (command == "bitboard-selftest") {
+        return RunBitboardSelftestCommand(argv[0]);
     }
     if (command == "statistic") {
         int depth = SurakartaMoveWeightUtil::DefaultDepth;

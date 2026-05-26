@@ -278,6 +278,26 @@ struct BenchmarkResult {
     SearchResult search_result{};
 };
 
+struct ActiveObjectiveConfigSkeleton {
+    bool config_present = false;
+    bool config_valid = false;
+    bool default_off = true;
+    bool skeleton_enabled = false;
+    bool scoped_config = false;
+    bool probe_wiring_skeleton = false;
+    bool no_output_probe_mode = false;
+    bool weight_artifact_suppressed = false;
+    bool active_objective_probe_executed = false;
+    bool selection_gate_eligible = false;
+    std::string mode;
+    std::string scope;
+    std::string reject_reason;
+    double opening_drift_penalty_weight{0.0};
+    int max_games{0};
+    int max_depth{0};
+    std::uint32_t seed{0};
+};
+
 struct TrainingOptions {
     SearchLimits limits{};
     std::string input_weights_path;
@@ -294,6 +314,8 @@ struct TrainingOptions {
     std::uint32_t seed{20260423};
     int checkpoint_every{0};
     std::string checkpoint_dir;
+    std::string active_objective_config_path;
+    ActiveObjectiveConfigSkeleton active_objective_config{};
 };
 
 struct TrainingStepContext {
@@ -357,6 +379,17 @@ struct TrainingSummary {
     int checkpoint_count{0};
     std::vector<TrainingCheckpointSummary> checkpoint_summaries{};
     std::string output_weights_path;
+    bool active_interface_config_present = false;
+    bool active_interface_config_valid = false;
+    bool active_interface_skeleton_enabled = false;
+    bool active_interface_scoped_config = false;
+    bool active_interface_probe_wiring_skeleton = false;
+    bool active_interface_no_output_probe_mode = false;
+    bool active_interface_weight_artifact_suppressed = false;
+    bool active_interface_report_only_probe_path = false;
+    bool active_objective_probe_executed = false;
+    bool selection_gate_eligible = false;
+    std::string active_interface_config_status{"default_off"};
 };
 
 struct EvalSearchReport {
@@ -413,6 +446,9 @@ double EvaluateTrainingValueForSideToMove(const NTupleWeights& weights, const Po
 double TrainingTerminalTarget(Color winner, Color side_to_update, double terminal_reward = 1200.0);
 Position BuildNearTerminalTrainingPosition(int sample_index);
 void ResetTrainingTraces(std::vector<double>& traces);
+bool ParseActiveObjectiveConfigSkeleton(const std::string& text,
+                                        ActiveObjectiveConfigSkeleton* config,
+                                        std::string* error_message = nullptr);
 bool ApplyTrainingStep(NTupleWeights& weights,
                        std::vector<double>& traces,
                        const Position& current,

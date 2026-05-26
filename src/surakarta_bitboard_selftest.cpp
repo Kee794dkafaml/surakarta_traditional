@@ -1765,6 +1765,102 @@ bool TestTdErrorClipLimitsAppliedUpdate() {
     return okay;
 }
 
+
+bool TestActiveObjectiveConfigSkeletonDefaultInvalidAndScopedConfig() {
+    auto okay = true;
+    const auto marker = std::string("Phase 3.41 config default invalid config scoped config skeleton marker");
+
+    auto defaults = TrainingOptions{};
+    okay &= Expect(marker.find("config default") != std::string::npos,
+                   "Phase 3.41 config default marker should be present");
+    okay &= Expect(!defaults.active_objective_config.config_present,
+                   "Phase 3.41 config default should be absent");
+    okay &= Expect(defaults.active_objective_config.default_off,
+                   "Phase 3.41 config default should be default-off");
+    okay &= Expect(!defaults.active_objective_config.skeleton_enabled,
+                   "Phase 3.41 config default should not enable skeleton");
+    okay &= Expect(!defaults.active_objective_config.active_objective_probe_executed,
+                   "Phase 3.41 config default should not execute active objective probe");
+    okay &= Expect(!defaults.active_objective_config.selection_gate_eligible,
+                   "Phase 3.41 config default should not be selection gate eligible");
+
+    auto invalid_config = surakarta::bitboard::ActiveObjectiveConfigSkeleton{};
+    auto invalid_error = std::string{};
+    okay &= Expect(!surakarta::bitboard::ParseActiveObjectiveConfigSkeleton(
+                       "{\"schema_version\":1,\"enabled\":true,\"mode\":\"active_scoped\"}",
+                       &invalid_config,
+                       &invalid_error),
+                   "Phase 3.41 invalid config should be rejected");
+    okay &= Expect(invalid_config.config_present,
+                   "Phase 3.41 invalid config should still record config presence");
+    okay &= Expect(!invalid_config.config_valid,
+                   "Phase 3.41 invalid config should not be valid");
+    okay &= Expect(!invalid_config.active_objective_probe_executed,
+                   "Phase 3.41 invalid config should not execute active objective probe");
+    okay &= Expect(!invalid_error.empty(),
+                   "Phase 3.41 invalid config should explain rejection");
+
+    const auto scoped_config_text =
+        std::string("{") +
+        "\"schema_version\":1,"
+        "\"enabled\":true,"
+        "\"mode\":\"active_scoped\","
+        "\"scope\":\"opening_root_children_only\","
+        "\"report_only\":true,"
+        "\"probe_only\":true,"
+        "\"no_output_weights\":true,"
+        "\"selection_gate_eligible\":false,"
+        "\"opening_drift_penalty_weight\":0.005,"
+        "\"max_games\":4,"
+        "\"max_depth\":4,"
+        "\"seed_allowlist\":[20260423]"
+        "}";
+    auto scoped_config = surakarta::bitboard::ActiveObjectiveConfigSkeleton{};
+    auto scoped_error = std::string{};
+    okay &= Expect(surakarta::bitboard::ParseActiveObjectiveConfigSkeleton(
+                       scoped_config_text, &scoped_config, &scoped_error),
+                   "Phase 3.41 valid scoped config should enter skeleton");
+    okay &= Expect(scoped_config.config_present && scoped_config.config_valid,
+                   "Phase 3.41 scoped config should be present and valid");
+    okay &= Expect(scoped_config.skeleton_enabled,
+                   "Phase 3.41 scoped config should enable interface skeleton");
+    okay &= Expect(!scoped_config.active_objective_probe_executed,
+                   "Phase 3.41 scoped config should not execute active objective probe");
+    okay &= Expect(!scoped_config.selection_gate_eligible,
+                   "Phase 3.41 scoped config should not be selection gate eligible");
+    okay &= Expect(scoped_config.no_output_probe_mode,
+                   "Phase 3.47 no output mode should be parsed");
+    okay &= Expect(scoped_config.weight_artifact_suppressed,
+                   "Phase 3.47 weight suppressed marker should be parsed");
+
+    auto skeleton_options = TrainingOptions{};
+    skeleton_options.active_objective_config = scoped_config;
+    skeleton_options.games = 1;
+    skeleton_options.limits.max_depth = 1;
+    auto skeleton_summary = surakarta::bitboard::TrainingSummary{};
+    auto skeleton_error = std::string{};
+    okay &= Expect(surakarta::bitboard::RunBitboardTraining(skeleton_options, &skeleton_summary, &skeleton_error),
+                   "Phase 3.47 no output wiring skeleton should not require output weights");
+    okay &= Expect(skeleton_summary.active_interface_no_output_probe_mode,
+                   "Phase 3.47 no output mode should be reported");
+    okay &= Expect(skeleton_summary.active_interface_weight_artifact_suppressed,
+                   "Phase 3.47 weight suppressed state should be reported");
+    okay &= Expect(skeleton_summary.active_interface_report_only_probe_path,
+                   "Phase 3.52 report-only active probe path should be implemented");
+    okay &= Expect(skeleton_summary.active_interface_config_status ==
+                       "report_only_objective_diagnostic_executed_no_output",
+                   "Phase 3.56 guarded report-only path should report objective diagnostic evidence");
+    okay &= Expect(skeleton_summary.output_weights_path.empty(),
+                   "Phase 3.47 no output mode should suppress weight artifact path");
+    okay &= Expect(skeleton_summary.games_completed == 0,
+                   "Phase 3.47 no output skeleton should not run training games");
+    okay &= Expect(skeleton_summary.active_objective_probe_executed,
+                   "Phase 3.56 guarded no-output path should execute report-only objective diagnostic evidence");
+    okay &= Expect(!skeleton_summary.selection_gate_eligible,
+                   "Phase 3.47 no output skeleton should remain not selection eligible");
+
+    return okay;
+}
 bool TestBitboardTrainingTraceCli() {
     TempDirGuard temp_dir("surakarta-trace-cli");
     const auto benchmark = BenchmarkExecutablePath();
@@ -2186,6 +2282,8 @@ int main() {
     ok &= TestTdZeroAlphaAndSmallDeltaDirection();
     std::cerr << "[TEST] TestTdErrorClipLimitsAppliedUpdate" << std::endl;
     ok &= TestTdErrorClipLimitsAppliedUpdate();
+    std::cerr << "[TEST] TestActiveObjectiveConfigSkeletonDefaultInvalidAndScopedConfig" << std::endl;
+    ok &= TestActiveObjectiveConfigSkeletonDefaultInvalidAndScopedConfig();
     std::cerr << "[TEST] TestBitboardTrainingTraceCli" << std::endl;
     ok &= TestBitboardTrainingTraceCli();
     std::cerr << "[TEST] TestBitboardTrainingJsonIncludesStabilizationParameters" << std::endl;
