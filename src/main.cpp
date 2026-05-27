@@ -1531,7 +1531,7 @@ int RunBitboardTrainCommand(int argc, char** argv) {
     auto error_message = std::string{};
     if (!surakarta::bitboard::RunBitboardTraining(options, &summary, &error_message)) {
         if (summary.active_interface_config_present) {
-            PrintTrainingSummary(summary, options.format);
+            PrintTrainingSummary(summary, format);
         }
         std::cerr << "bitboard-train failed: " << error_message << std::endl;
         return 1;
