@@ -1,9 +1,13 @@
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -116,9 +120,67 @@ void LoadBitboardPosition(const std::string& file_name, surakarta::bitboard::Pos
     position = surakarta::bitboard::PositionBuilder::FromLegacy(*game.GetBoard(), *game.GetGameInfo());
 }
 
+enum class TraceOutputFormat {
+    Json,
+    Csv,
+};
+
 enum class OutputFormat {
     Text,
     Json,
+};
+
+struct CliRootMoveDiagnostic {
+    int depth{0};
+    int attempt{0};
+    int move_index{0};
+    std::string move;
+    int alpha{0};
+    int beta{0};
+    int score{0};
+    int bound{0};
+    std::uint64_t nodes{0};
+    std::uint64_t qnodes{0};
+    std::uint64_t fail_highs{0};
+    std::uint64_t fail_lows{0};
+    std::uint64_t tt_hits{0};
+    std::uint64_t beta_cutoffs{0};
+    std::uint64_t qsearch_entries{0};
+    std::uint64_t qsearch_capture_moves{0};
+    std::uint64_t root_best_updates{0};
+    std::string pv;
+};
+
+struct CliAspirationDiagnostic {
+    int depth{0};
+    int attempt{0};
+    int alpha{0};
+    int beta{0};
+    int score{0};
+    std::string outcome;
+    std::uint64_t nodes{0};
+    std::uint64_t qnodes{0};
+    std::uint64_t root_best_updates{0};
+    std::uint64_t fail_highs{0};
+    std::uint64_t fail_lows{0};
+};
+
+struct CliQsearchDiagnostic {
+    int depth{0};
+    int attempt{0};
+    int root_move_index{0};
+    std::string root_move;
+    int ply{0};
+    int score{0};
+    std::uint64_t qnodes{0};
+    std::uint64_t capture_moves{0};
+    std::string line;
+};
+
+struct CliSearchDiagnostics {
+    std::vector<CliRootMoveDiagnostic> root_moves{};
+    std::vector<CliAspirationDiagnostic> aspiration_attempts{};
+    std::vector<CliQsearchDiagnostic> qsearch_sources{};
 };
 
 struct CliSearchReport {
@@ -152,6 +214,52 @@ struct CliSearchReport {
     std::uint64_t movegen_nodes{0};
     double movegen_seconds{0.0};
     std::uint64_t movegen_nps{0};
+    CliSearchDiagnostics diagnostics{};
+};
+
+struct BitboardTraceStep {
+    int game_index{0};
+    int ply{0};
+    std::string side_to_move;
+    double reward{0.0};
+    double value_before{0.0};
+    double value_after{0.0};
+    double bootstrap_value{0.0};
+    double td_error{0.0};
+    double trace_norm{0.0};
+    double weight_delta_norm{0.0};
+    std::string terminal_reason;
+};
+
+struct BitboardTraceReport {
+    std::uint32_t seed{0};
+    int games_requested{0};
+    int depth{4};
+    double alpha{0.005};
+    double lambda{0.5};
+    double epsilon{0.02};
+    int epsilon_plies{6};
+    double terminal_reward{1200.0};
+    double td_error_clip{0.0};
+    int terminal_only_warmup{0};
+    int near_terminal_curriculum{0};
+    std::vector<BitboardTraceStep> steps{};
+};
+
+struct BitboardTraceOptions {
+    int games{1};
+    int depth{4};
+    double alpha{0.005};
+    double lambda{0.5};
+    double epsilon{0.02};
+    int epsilon_plies{6};
+    double terminal_reward{1200.0};
+    double td_error_clip{0.0};
+    int terminal_only_warmup{0};
+    int near_terminal_curriculum{0};
+    std::uint32_t seed{0};
+    std::string weights_file;
+    TraceOutputFormat format{TraceOutputFormat::Json};
 };
 
 std::string EscapeJsonString(const std::string& value) {
@@ -186,6 +294,154 @@ std::string FormatDouble(double value) {
     auto stream = std::ostringstream{};
     stream << std::fixed << std::setprecision(6) << value;
     return stream.str();
+}
+
+std::string QuoteCommandPath(const std::filesystem::path& path) {
+    return "\"" + path.string() + "\"";
+}
+
+int RunBitboardSelftestCommand(const char* argv0) {
+    const auto benchmark_path = std::filesystem::absolute(std::filesystem::path(argv0));
+    const auto selftest_path = benchmark_path.parent_path() / "surakarta-bitboard-selftest.exe";
+    if (!std::filesystem::exists(selftest_path)) {
+        std::cerr << "bitboard-selftest failed: " << selftest_path.string() << " not found" << std::endl;
+        return 1;
+    }
+    return std::system(QuoteCommandPath(selftest_path).c_str());
+}
+
+const char* BoolJson(bool value) {
+    return value ? "true" : "false";
+}
+
+TraceOutputFormat ParseTraceOutputFormat(const std::string& value) {
+    return value == "csv" ? TraceOutputFormat::Csv : TraceOutputFormat::Json;
+}
+
+std::string BitboardColorName(surakarta::bitboard::Color color) {
+    switch (color) {
+        case surakarta::bitboard::Color::Black:
+            return "black";
+        case surakarta::bitboard::Color::White:
+            return "white";
+        default:
+            return "none";
+    }
+}
+
+bool IsTraceTerminalPosition(const surakarta::bitboard::Position& position) {
+    const auto side = position.SideToMove();
+    const auto enemy = side == surakarta::bitboard::Color::Black
+                           ? surakarta::bitboard::Color::White
+                           : surakarta::bitboard::Color::Black;
+    return position.board.Count(side) == 0 ||
+           position.board.Count(enemy) == 0 ||
+           position.no_capture_ply >= position.max_no_capture_round;
+}
+
+std::string TraceTerminalReason(const surakarta::bitboard::Position& next,
+                                const surakarta::bitboard::TrainingStepContext& context) {
+    if (next.no_capture_ply >= next.max_no_capture_round) {
+        return "no_capture_limit";
+    }
+    if (next.board.Count(surakarta::bitboard::Color::Black) == 0 ||
+        next.board.Count(surakarta::bitboard::Color::White) == 0) {
+        return "terminal";
+    }
+    if (!context.next_has_legal_moves) {
+        return "no_legal_move";
+    }
+    if (context.next_is_ply_cap) {
+        return "ply_cap";
+    }
+    return "none";
+}
+
+double L2Norm(const std::vector<double>& values) {
+    auto squared = 0.0;
+    for (const auto value : values) {
+        squared += value * value;
+    }
+    return std::sqrt(squared);
+}
+
+double L2DeltaNorm(const std::vector<double>& before, const std::vector<double>& after) {
+    const auto size = std::min(before.size(), after.size());
+    auto squared = 0.0;
+    for (std::size_t i = 0; i < size; ++i) {
+        const auto delta = after[i] - before[i];
+        squared += delta * delta;
+    }
+    return std::sqrt(squared);
+}
+
+void PrintBitboardTraceReport(const BitboardTraceReport& report, TraceOutputFormat format) {
+    if (format == TraceOutputFormat::Csv) {
+        std::cout << "seed,games_requested,depth,alpha,lambda,epsilon,epsilon_plies,"
+                     "terminal_reward,td_error_clip,terminal_only_warmup,near_terminal_curriculum,"
+                     "game,ply,side_to_move,reward,value_before,value_after,bootstrap_value,"
+                     "td_error,trace_norm,weight_delta_norm,terminal_reason"
+                  << std::endl;
+        for (const auto& step : report.steps) {
+            std::cout << report.seed << ","
+                      << report.games_requested << ","
+                      << report.depth << ","
+                      << FormatDouble(report.alpha) << ","
+                      << FormatDouble(report.lambda) << ","
+                      << FormatDouble(report.epsilon) << ","
+                      << report.epsilon_plies << ","
+                      << FormatDouble(report.terminal_reward) << ","
+                      << FormatDouble(report.td_error_clip) << ","
+                      << report.terminal_only_warmup << ","
+                      << report.near_terminal_curriculum << ","
+                      << step.game_index << ","
+                      << step.ply << ","
+                      << step.side_to_move << ","
+                      << FormatDouble(step.reward) << ","
+                      << FormatDouble(step.value_before) << ","
+                      << FormatDouble(step.value_after) << ","
+                      << FormatDouble(step.bootstrap_value) << ","
+                      << FormatDouble(step.td_error) << ","
+                      << FormatDouble(step.trace_norm) << ","
+                      << FormatDouble(step.weight_delta_norm) << ","
+                      << step.terminal_reason << std::endl;
+        }
+        return;
+    }
+
+    std::cout << "{"
+              << "\"seed\":" << report.seed << ","
+              << "\"games\":" << report.games_requested << ","
+              << "\"depth\":" << report.depth << ","
+              << "\"alpha\":" << FormatDouble(report.alpha) << ","
+              << "\"lambda\":" << FormatDouble(report.lambda) << ","
+              << "\"epsilon\":" << FormatDouble(report.epsilon) << ","
+              << "\"epsilon_plies\":" << report.epsilon_plies << ","
+              << "\"terminal_reward\":" << FormatDouble(report.terminal_reward) << ","
+              << "\"td_error_clip\":" << FormatDouble(report.td_error_clip) << ","
+              << "\"terminal_only_warmup\":" << report.terminal_only_warmup << ","
+              << "\"near_terminal_curriculum\":" << report.near_terminal_curriculum << ","
+              << "\"steps\":[";
+    for (std::size_t i = 0; i < report.steps.size(); ++i) {
+        const auto& step = report.steps[i];
+        if (i > 0) {
+            std::cout << ",";
+        }
+        std::cout << "{"
+                  << "\"game\":" << step.game_index << ","
+                  << "\"ply\":" << step.ply << ","
+                  << "\"side_to_move\":\"" << EscapeJsonString(step.side_to_move) << "\","
+                  << "\"reward\":" << FormatDouble(step.reward) << ","
+                  << "\"value_before\":" << FormatDouble(step.value_before) << ","
+                  << "\"value_after\":" << FormatDouble(step.value_after) << ","
+                  << "\"bootstrap_value\":" << FormatDouble(step.bootstrap_value) << ","
+                  << "\"td_error\":" << FormatDouble(step.td_error) << ","
+                  << "\"trace_norm\":" << FormatDouble(step.trace_norm) << ","
+                  << "\"weight_delta_norm\":" << FormatDouble(step.weight_delta_norm) << ","
+                  << "\"terminal_reason\":\"" << EscapeJsonString(step.terminal_reason) << "\""
+                  << "}";
+    }
+    std::cout << "]}" << std::endl;
 }
 
 std::string DeriveCaseId(const std::string& explicit_case_id, const std::string& file_name) {
@@ -238,6 +494,11 @@ std::string FormatPrincipalVariation(
     return text.empty() ? "n/a" : text;
 }
 
+std::string FormatDiagnosticLine(const surakarta::bitboard::Position& root,
+                                 const surakarta::bitboard::SearchDiagnosticLine& line) {
+    return FormatPrincipalVariation(root, line.moves, line.length);
+}
+
 CliSearchReport BuildSearchReport(const std::string& case_id,
                                   const surakarta::bitboard::Position& position,
                                   const surakarta::bitboard::SearchLimits& limits,
@@ -270,7 +531,136 @@ CliSearchReport BuildSearchReport(const std::string& case_id,
     report.pv = FormatPrincipalVariation(position, result.pv, result.pv_length);
     report.best_move = FormatMoveForPosition(position, result.best_move);
     report.score = result.score;
+
+    for (const auto& entry : result.diagnostics.root_moves) {
+        auto diagnostic = CliRootMoveDiagnostic{};
+        diagnostic.depth = entry.depth;
+        diagnostic.attempt = entry.attempt;
+        diagnostic.move_index = entry.move_index;
+        diagnostic.move = FormatMoveForPosition(position, entry.move);
+        diagnostic.alpha = entry.alpha;
+        diagnostic.beta = entry.beta;
+        diagnostic.score = entry.score;
+        diagnostic.bound = entry.bound;
+        diagnostic.nodes = entry.nodes;
+        diagnostic.qnodes = entry.qnodes;
+        diagnostic.fail_highs = entry.fail_highs;
+        diagnostic.fail_lows = entry.fail_lows;
+        diagnostic.tt_hits = entry.tt_hits;
+        diagnostic.beta_cutoffs = entry.beta_cutoffs;
+        diagnostic.qsearch_entries = entry.qsearch_entries;
+        diagnostic.qsearch_capture_moves = entry.qsearch_capture_moves;
+        diagnostic.root_best_updates = entry.root_best_updates;
+        diagnostic.pv = FormatDiagnosticLine(position, entry.pv);
+        report.diagnostics.root_moves.push_back(diagnostic);
+    }
+
+    for (const auto& entry : result.diagnostics.aspiration_attempts) {
+        auto diagnostic = CliAspirationDiagnostic{};
+        diagnostic.depth = entry.depth;
+        diagnostic.attempt = entry.attempt;
+        diagnostic.alpha = entry.alpha;
+        diagnostic.beta = entry.beta;
+        diagnostic.score = entry.score;
+        diagnostic.outcome = entry.outcome;
+        diagnostic.nodes = entry.nodes;
+        diagnostic.qnodes = entry.qnodes;
+        diagnostic.root_best_updates = entry.root_best_updates;
+        diagnostic.fail_highs = entry.fail_highs;
+        diagnostic.fail_lows = entry.fail_lows;
+        report.diagnostics.aspiration_attempts.push_back(diagnostic);
+    }
+
+    for (const auto& entry : result.diagnostics.qsearch_sources) {
+        auto diagnostic = CliQsearchDiagnostic{};
+        diagnostic.depth = entry.depth;
+        diagnostic.attempt = entry.attempt;
+        diagnostic.root_move_index = entry.root_move_index;
+        diagnostic.root_move = FormatMoveForPosition(position, entry.root_move);
+        diagnostic.ply = entry.ply;
+        diagnostic.score = entry.score;
+        diagnostic.qnodes = entry.qnodes;
+        diagnostic.capture_moves = entry.capture_moves;
+        diagnostic.line = FormatDiagnosticLine(position, entry.line);
+        report.diagnostics.qsearch_sources.push_back(diagnostic);
+    }
     return report;
+}
+
+bool HasSearchDiagnostics(const CliSearchReport& report) {
+    return !report.diagnostics.root_moves.empty() ||
+           !report.diagnostics.aspiration_attempts.empty() ||
+           !report.diagnostics.qsearch_sources.empty();
+}
+
+void PrintSearchDiagnosticsJson(const CliSearchDiagnostics& diagnostics) {
+    std::cout << "\"diagnostics\":{";
+    std::cout << "\"root_moves\":[";
+    for (std::size_t i = 0; i < diagnostics.root_moves.size(); ++i) {
+        const auto& entry = diagnostics.root_moves[i];
+        if (i > 0) {
+            std::cout << ",";
+        }
+        std::cout << "{"
+                  << "\"depth\":" << entry.depth << ","
+                  << "\"attempt\":" << entry.attempt << ","
+                  << "\"move_index\":" << entry.move_index << ","
+                  << "\"move\":\"" << EscapeJsonString(entry.move) << "\","
+                  << "\"alpha\":" << entry.alpha << ","
+                  << "\"beta\":" << entry.beta << ","
+                  << "\"score\":" << entry.score << ","
+                  << "\"bound\":" << entry.bound << ","
+                  << "\"nodes\":" << entry.nodes << ","
+                  << "\"qnodes\":" << entry.qnodes << ","
+                  << "\"fail_highs\":" << entry.fail_highs << ","
+                  << "\"fail_lows\":" << entry.fail_lows << ","
+                  << "\"tt_hits\":" << entry.tt_hits << ","
+                  << "\"beta_cutoffs\":" << entry.beta_cutoffs << ","
+                  << "\"qsearch_entries\":" << entry.qsearch_entries << ","
+                  << "\"qsearch_capture_moves\":" << entry.qsearch_capture_moves << ","
+                  << "\"root_best_updates\":" << entry.root_best_updates << ","
+                  << "\"pv\":\"" << EscapeJsonString(entry.pv) << "\""
+                  << "}";
+    }
+    std::cout << "],\"aspiration_attempts\":[";
+    for (std::size_t i = 0; i < diagnostics.aspiration_attempts.size(); ++i) {
+        const auto& entry = diagnostics.aspiration_attempts[i];
+        if (i > 0) {
+            std::cout << ",";
+        }
+        std::cout << "{"
+                  << "\"depth\":" << entry.depth << ","
+                  << "\"attempt\":" << entry.attempt << ","
+                  << "\"alpha\":" << entry.alpha << ","
+                  << "\"beta\":" << entry.beta << ","
+                  << "\"score\":" << entry.score << ","
+                  << "\"outcome\":\"" << EscapeJsonString(entry.outcome) << "\","
+                  << "\"nodes\":" << entry.nodes << ","
+                  << "\"qnodes\":" << entry.qnodes << ","
+                  << "\"root_best_updates\":" << entry.root_best_updates << ","
+                  << "\"fail_highs\":" << entry.fail_highs << ","
+                  << "\"fail_lows\":" << entry.fail_lows
+                  << "}";
+    }
+    std::cout << "],\"qsearch_sources\":[";
+    for (std::size_t i = 0; i < diagnostics.qsearch_sources.size(); ++i) {
+        const auto& entry = diagnostics.qsearch_sources[i];
+        if (i > 0) {
+            std::cout << ",";
+        }
+        std::cout << "{"
+                  << "\"depth\":" << entry.depth << ","
+                  << "\"attempt\":" << entry.attempt << ","
+                  << "\"root_move_index\":" << entry.root_move_index << ","
+                  << "\"root_move\":\"" << EscapeJsonString(entry.root_move) << "\","
+                  << "\"ply\":" << entry.ply << ","
+                  << "\"score\":" << entry.score << ","
+                  << "\"qnodes\":" << entry.qnodes << ","
+                  << "\"capture_moves\":" << entry.capture_moves << ","
+                  << "\"line\":\"" << EscapeJsonString(entry.line) << "\""
+                  << "}";
+    }
+    std::cout << "]}";
 }
 
 void PrintSearchReport(const CliSearchReport& report, OutputFormat format) {
@@ -307,6 +697,10 @@ void PrintSearchReport(const CliSearchReport& report, OutputFormat format) {
                       << ",\"movegen_seconds\":" << FormatDouble(report.movegen_seconds)
                       << ",\"movegen_nps\":" << report.movegen_nps;
         }
+        if (HasSearchDiagnostics(report)) {
+            std::cout << ",";
+            PrintSearchDiagnosticsJson(report.diagnostics);
+        }
         std::cout << "}" << std::endl;
         return;
     }
@@ -342,6 +736,41 @@ void PrintSearchReport(const CliSearchReport& report, OutputFormat format) {
     std::cout << "pv: " << report.pv << std::endl;
     std::cout << "best_move: " << report.best_move << std::endl;
     std::cout << "score: " << report.score << std::endl;
+    if (HasSearchDiagnostics(report)) {
+        for (const auto& entry : report.diagnostics.aspiration_attempts) {
+            std::cout << "aspiration_attempt: depth=" << entry.depth
+                      << " attempt=" << entry.attempt
+                      << " window=[" << entry.alpha << "," << entry.beta << "]"
+                      << " score=" << entry.score
+                      << " outcome=" << entry.outcome
+                      << " nodes=" << entry.nodes
+                      << " qnodes=" << entry.qnodes
+                      << std::endl;
+        }
+        for (const auto& entry : report.diagnostics.root_moves) {
+            std::cout << "root_move: depth=" << entry.depth
+                      << " attempt=" << entry.attempt
+                      << " index=" << entry.move_index
+                      << " move=" << entry.move
+                      << " score=" << entry.score
+                      << " nodes=" << entry.nodes
+                      << " qnodes=" << entry.qnodes
+                      << " fail_highs=" << entry.fail_highs
+                      << " root_best_updates=" << entry.root_best_updates
+                      << " pv=" << entry.pv
+                      << std::endl;
+        }
+        for (const auto& entry : report.diagnostics.qsearch_sources) {
+            std::cout << "qsearch_source: depth=" << entry.depth
+                      << " attempt=" << entry.attempt
+                      << " root_move=" << entry.root_move
+                      << " ply=" << entry.ply
+                      << " qnodes=" << entry.qnodes
+                      << " captures=" << entry.capture_moves
+                      << " line=" << entry.line
+                      << std::endl;
+        }
+    }
 }
 
 struct CommonBitboardOptions {
@@ -352,6 +781,7 @@ struct CommonBitboardOptions {
     std::string weights_file;
     std::string case_id;
     OutputFormat format{OutputFormat::Text};
+    bool search_diagnostics{false};
 };
 
 bool RequireValue(int argc, char** argv, int* index, const char* option_name) {
@@ -400,6 +830,9 @@ bool ParseCommonBitboardOptions(int argc, char** argv, CommonBitboardOptions* op
                 return false;
             }
             options->case_id = argv[i];
+        } else if (strcmp(argv[i], "--search-diagnostics") == 0 ||
+                   strcmp(argv[i], "--debug-search-tree") == 0) {
+            options->search_diagnostics = true;
         } else {
             std::cerr << "Unknown option: " << argv[i] << std::endl;
             return false;
@@ -414,16 +847,75 @@ void PrintTrainingSummary(const surakarta::bitboard::TrainingSummary& summary, O
         std::cout << "{"
                   << "\"games_requested\":" << summary.games_requested << ","
                   << "\"games_completed\":" << summary.games_completed << ","
+                  << "\"seed\":" << summary.seed << ","
+                  << "\"depth\":" << summary.depth << ","
+                  << "\"alpha\":" << FormatDouble(summary.alpha) << ","
+                  << "\"lambda\":" << FormatDouble(summary.lambda) << ","
+                  << "\"epsilon\":" << FormatDouble(summary.epsilon) << ","
+                  << "\"epsilon_plies\":" << summary.epsilon_plies << ","
+                  << "\"terminal_reward\":" << FormatDouble(summary.terminal_reward) << ","
+                  << "\"td_error_clip\":" << FormatDouble(summary.td_error_clip) << ","
+                  << "\"terminal_only_warmup\":" << summary.terminal_only_warmup << ","
+                  << "\"near_terminal_curriculum\":" << summary.near_terminal_curriculum << ","
                   << "\"black_wins\":" << summary.black_wins << ","
                   << "\"white_wins\":" << summary.white_wins << ","
                   << "\"draws\":" << summary.draws << ","
+                  << "\"terminal_checkmate\":" << summary.terminal_checkmate << ","
+                  << "\"terminal_no_capture_limit\":" << summary.terminal_no_capture_limit << ","
+                  << "\"terminal_no_legal_move\":" << summary.terminal_no_legal_move << ","
+                  << "\"terminal_ply_cap\":" << summary.terminal_ply_cap << ","
                   << "\"positions_evaluated\":" << summary.positions_evaluated << ","
                   << "\"update_count\":" << summary.update_count << ","
                   << "\"average_abs_td_error\":" << FormatDouble(summary.average_abs_td_error) << ","
                   << "\"max_abs_td_error\":" << FormatDouble(summary.max_abs_td_error) << ","
                   << "\"average_abs_weight_delta\":" << FormatDouble(summary.average_abs_weight_delta) << ","
                   << "\"max_abs_weight_delta\":" << FormatDouble(summary.max_abs_weight_delta) << ","
+                  << "\"active_interface_config_present\":" << BoolJson(summary.active_interface_config_present) << ","
+                  << "\"active_interface_config_valid\":" << BoolJson(summary.active_interface_config_valid) << ","
+                  << "\"active_interface_skeleton_enabled\":" << BoolJson(summary.active_interface_skeleton_enabled) << ","
+                  << "\"active_interface_scoped_config\":" << BoolJson(summary.active_interface_scoped_config) << ","
+                  << "\"active_interface_probe_wiring_skeleton\":"
+                  << BoolJson(summary.active_interface_probe_wiring_skeleton) << ","
+                  << "\"active_interface_no_output_probe_mode\":"
+                  << BoolJson(summary.active_interface_no_output_probe_mode) << ","
+                  << "\"active_interface_weight_artifact_suppressed\":"
+                  << BoolJson(summary.active_interface_weight_artifact_suppressed) << ","
+                  << "\"active_interface_report_only_probe_path\":"
+                  << BoolJson(summary.active_interface_report_only_probe_path) << ","
+                  << "\"active_objective_probe_executed\":"
+                  << BoolJson(summary.active_objective_probe_executed) << ","
+                  << "\"selection_gate_eligible\":" << BoolJson(summary.selection_gate_eligible) << ","
+                  << "\"active_interface_config_status\":\""
+                  << EscapeJsonString(summary.active_interface_config_status) << "\","
+                  << "\"active_interface_reject_reason\":\""
+                  << EscapeJsonString(summary.active_interface_reject_reason) << "\","
+
                   << "\"checkpoint_count\":" << summary.checkpoint_count << ","
+                  << "\"checkpoint_summaries\":[";
+        for (std::size_t i = 0; i < summary.checkpoint_summaries.size(); ++i) {
+            const auto& checkpoint = summary.checkpoint_summaries[i];
+            if (i > 0) {
+                std::cout << ",";
+            }
+            std::cout << "{"
+                      << "\"games_completed\":" << checkpoint.games_completed << ","
+                      << "\"path\":\"" << EscapeJsonString(checkpoint.path) << "\","
+                      << "\"black_wins\":" << checkpoint.black_wins << ","
+                      << "\"white_wins\":" << checkpoint.white_wins << ","
+                      << "\"draws\":" << checkpoint.draws << ","
+                      << "\"terminal_checkmate\":" << checkpoint.terminal_checkmate << ","
+                      << "\"terminal_no_capture_limit\":" << checkpoint.terminal_no_capture_limit << ","
+                      << "\"terminal_no_legal_move\":" << checkpoint.terminal_no_legal_move << ","
+                      << "\"terminal_ply_cap\":" << checkpoint.terminal_ply_cap << ","
+                      << "\"positions_evaluated\":" << checkpoint.positions_evaluated << ","
+                      << "\"update_count\":" << checkpoint.update_count << ","
+                      << "\"average_abs_td_error\":" << FormatDouble(checkpoint.average_abs_td_error) << ","
+                      << "\"max_abs_td_error\":" << FormatDouble(checkpoint.max_abs_td_error) << ","
+                      << "\"average_abs_weight_delta\":" << FormatDouble(checkpoint.average_abs_weight_delta) << ","
+                      << "\"max_abs_weight_delta\":" << FormatDouble(checkpoint.max_abs_weight_delta)
+                      << "}";
+        }
+        std::cout << "],"
                   << "\"output_weights\":\"" << EscapeJsonString(summary.output_weights_path) << "\""
                   << "}" << std::endl;
         return;
@@ -431,16 +923,57 @@ void PrintTrainingSummary(const surakarta::bitboard::TrainingSummary& summary, O
 
     std::cout << "games_requested: " << summary.games_requested << std::endl;
     std::cout << "games_completed: " << summary.games_completed << std::endl;
+    std::cout << "seed: " << summary.seed << std::endl;
+    std::cout << "depth: " << summary.depth << std::endl;
+    std::cout << "alpha: " << summary.alpha << std::endl;
+    std::cout << "lambda: " << summary.lambda << std::endl;
+    std::cout << "epsilon: " << summary.epsilon << std::endl;
+    std::cout << "epsilon_plies: " << summary.epsilon_plies << std::endl;
+    std::cout << "terminal_reward: " << summary.terminal_reward << std::endl;
+    std::cout << "td_error_clip: " << summary.td_error_clip << std::endl;
+    std::cout << "terminal_only_warmup: " << summary.terminal_only_warmup << std::endl;
+    std::cout << "near_terminal_curriculum: " << summary.near_terminal_curriculum << std::endl;
     std::cout << "black_wins: " << summary.black_wins << std::endl;
     std::cout << "white_wins: " << summary.white_wins << std::endl;
     std::cout << "draws: " << summary.draws << std::endl;
+    std::cout << "terminal_checkmate: " << summary.terminal_checkmate << std::endl;
+    std::cout << "terminal_no_capture_limit: " << summary.terminal_no_capture_limit << std::endl;
+    std::cout << "terminal_no_legal_move: " << summary.terminal_no_legal_move << std::endl;
+    std::cout << "terminal_ply_cap: " << summary.terminal_ply_cap << std::endl;
     std::cout << "positions_evaluated: " << summary.positions_evaluated << std::endl;
     std::cout << "update_count: " << summary.update_count << std::endl;
     std::cout << "average_abs_td_error: " << summary.average_abs_td_error << std::endl;
     std::cout << "max_abs_td_error: " << summary.max_abs_td_error << std::endl;
     std::cout << "average_abs_weight_delta: " << summary.average_abs_weight_delta << std::endl;
     std::cout << "max_abs_weight_delta: " << summary.max_abs_weight_delta << std::endl;
+    std::cout << "active_interface_config_present: " << BoolJson(summary.active_interface_config_present) << std::endl;
+    std::cout << "active_interface_config_valid: " << BoolJson(summary.active_interface_config_valid) << std::endl;
+    std::cout << "active_interface_skeleton_enabled: "
+              << BoolJson(summary.active_interface_skeleton_enabled) << std::endl;
+    std::cout << "active_interface_scoped_config: " << BoolJson(summary.active_interface_scoped_config) << std::endl;
+    std::cout << "active_interface_probe_wiring_skeleton: "
+              << BoolJson(summary.active_interface_probe_wiring_skeleton) << std::endl;
+    std::cout << "active_interface_no_output_probe_mode: "
+              << BoolJson(summary.active_interface_no_output_probe_mode) << std::endl;
+    std::cout << "active_interface_weight_artifact_suppressed: "
+              << BoolJson(summary.active_interface_weight_artifact_suppressed) << std::endl;
+    std::cout << "active_interface_report_only_probe_path: "
+              << BoolJson(summary.active_interface_report_only_probe_path) << std::endl;
+    std::cout << "active_objective_probe_executed: " << BoolJson(summary.active_objective_probe_executed) << std::endl;
+    std::cout << "selection_gate_eligible: " << BoolJson(summary.selection_gate_eligible) << std::endl;
+    std::cout << "active_interface_config_status: " << summary.active_interface_config_status << std::endl;
+    std::cout << "active_interface_reject_reason: " << summary.active_interface_reject_reason << std::endl;
     std::cout << "checkpoint_count: " << summary.checkpoint_count << std::endl;
+    for (const auto& checkpoint : summary.checkpoint_summaries) {
+        std::cout << "checkpoint_summary: games_completed=" << checkpoint.games_completed
+                  << " path=" << checkpoint.path
+                  << " black_wins=" << checkpoint.black_wins
+                  << " white_wins=" << checkpoint.white_wins
+                  << " draws=" << checkpoint.draws
+                  << " average_abs_td_error=" << checkpoint.average_abs_td_error
+                  << " max_abs_weight_delta=" << checkpoint.max_abs_weight_delta
+                  << std::endl;
+    }
     std::cout << "output_weights: " << summary.output_weights_path << std::endl;
 }
 
@@ -534,6 +1067,7 @@ int RunBitboardSearch(const std::string& file_name,
                       int threads,
                       int aspiration_window,
                       const std::string& weights_file,
+                      bool search_diagnostics,
                       OutputFormat format) {
     auto position = surakarta::bitboard::Position{};
     LoadBitboardPosition(file_name, position);
@@ -541,6 +1075,7 @@ int RunBitboardSearch(const std::string& file_name,
     limits.max_depth = depth;
     limits.threads = threads;
     limits.aspiration_window = aspiration_window;
+    limits.enable_diagnostics = search_diagnostics;
 
     auto controller = surakarta::bitboard::SearchController{};
     if (!weights_file.empty() && !controller.Evaluator().LoadWeights(weights_file)) {
@@ -567,6 +1102,7 @@ int RunBitboardBenchmarkCli(const std::string& file_name,
                             int aspiration_window,
                             int movegen_iterations,
                             const std::string& weights_file,
+                            bool search_diagnostics,
                             OutputFormat format) {
     auto position = surakarta::bitboard::Position{};
     LoadBitboardPosition(file_name, position);
@@ -574,6 +1110,7 @@ int RunBitboardBenchmarkCli(const std::string& file_name,
     limits.max_depth = depth;
     limits.threads = threads;
     limits.aspiration_window = aspiration_window;
+    limits.enable_diagnostics = search_diagnostics;
 
     auto controller = surakarta::bitboard::SearchController{};
     if (!weights_file.empty() && !controller.Evaluator().LoadWeights(weights_file)) {
@@ -601,10 +1138,11 @@ int RunBitboardSearchCommand(int argc, char** argv) {
     return RunBitboardSearch(options.file_name,
                              options.case_id,
                              options.depth,
-                             options.threads,
-                             options.aspiration_window,
-                             options.weights_file,
-                             options.format);
+                              options.threads,
+                              options.aspiration_window,
+                              options.weights_file,
+                              options.search_diagnostics,
+                              options.format);
 }
 
 int RunBitboardBenchmarkCommand(int argc, char** argv) {
@@ -650,11 +1188,229 @@ int RunBitboardBenchmarkCommand(int argc, char** argv) {
     return RunBitboardBenchmarkCli(options.file_name,
                                    options.case_id,
                                    options.depth,
-                                   options.threads,
-                                   options.aspiration_window,
-                                   movegen_iterations,
-                                   options.weights_file,
-                                   options.format);
+                                     options.threads,
+                                     options.aspiration_window,
+                                     movegen_iterations,
+                                     options.weights_file,
+                                     options.search_diagnostics,
+                                     options.format);
+}
+
+bool ParseBitboardTraceOptions(int argc, char** argv, BitboardTraceOptions* options) {
+    for (int i = 0; i < argc; ++i) {
+        if (strcmp(argv[i], "--weights") == 0 || strcmp(argv[i], "-w") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return false;
+            }
+            options->weights_file = argv[i];
+        } else if (strcmp(argv[i], "--games") == 0 || strcmp(argv[i], "-g") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return false;
+            }
+            options->games = atoi(argv[i]);
+        } else if (strcmp(argv[i], "--depth") == 0 || strcmp(argv[i], "-d") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return false;
+            }
+            options->depth = atoi(argv[i]);
+        } else if (strcmp(argv[i], "--alpha") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return false;
+            }
+            options->alpha = atof(argv[i]);
+        } else if (strcmp(argv[i], "--lambda") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return false;
+            }
+            options->lambda = atof(argv[i]);
+        } else if (strcmp(argv[i], "--epsilon") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return false;
+            }
+            options->epsilon = atof(argv[i]);
+        } else if (strcmp(argv[i], "--epsilon-plies") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return false;
+            }
+            options->epsilon_plies = atoi(argv[i]);
+        } else if (strcmp(argv[i], "--terminal-reward") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return false;
+            }
+            options->terminal_reward = atof(argv[i]);
+        } else if (strcmp(argv[i], "--td-error-clip") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return false;
+            }
+            options->td_error_clip = atof(argv[i]);
+        } else if (strcmp(argv[i], "--terminal-only-warmup") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return false;
+            }
+            options->terminal_only_warmup = atoi(argv[i]);
+        } else if (strcmp(argv[i], "--near-terminal-curriculum") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return false;
+            }
+            options->near_terminal_curriculum = atoi(argv[i]);
+        } else if (strcmp(argv[i], "--seed") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return false;
+            }
+            options->seed = static_cast<std::uint32_t>(std::strtoul(argv[i], nullptr, 10));
+        } else if (strcmp(argv[i], "--format") == 0 || strcmp(argv[i], "-F") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return false;
+            }
+            options->format = ParseTraceOutputFormat(argv[i]);
+        } else {
+            std::cerr << "Unknown option: " << argv[i] << std::endl;
+            return false;
+        }
+    }
+    return true;
+}
+
+int RunBitboardTraceCommand(int argc, char** argv) {
+    constexpr int kTraceTrainingMaxPlies = 256;
+
+    auto options = BitboardTraceOptions{};
+    if (!ParseBitboardTraceOptions(argc, argv, &options)) {
+        return 1;
+    }
+    options.games = std::max(1, options.games);
+    options.depth = options.depth > 0 ? options.depth : 4;
+    options.epsilon_plies = std::max(0, options.epsilon_plies);
+    if (options.terminal_reward <= 0.0) {
+        std::cerr << "terminal reward must be positive" << std::endl;
+        return 1;
+    }
+    if (options.td_error_clip < 0.0) {
+        std::cerr << "td error clip must be non-negative" << std::endl;
+        return 1;
+    }
+    options.terminal_only_warmup = std::max(0, options.terminal_only_warmup);
+    options.near_terminal_curriculum = std::max(0, options.near_terminal_curriculum);
+
+    auto controller = surakarta::bitboard::SearchController{};
+    if (!options.weights_file.empty() && !controller.Evaluator().LoadWeights(options.weights_file)) {
+        std::cerr << "Failed to load weight file: " << options.weights_file << std::endl;
+        return 1;
+    }
+
+    auto weights = controller.Evaluator().ExportWeights();
+    auto traces = std::vector<double>(weights.values.size(), 0.0);
+    auto rng = std::mt19937(options.seed);
+    auto random_unit = std::uniform_real_distribution<double>(0.0, 1.0);
+
+    auto limits = surakarta::bitboard::SearchLimits{};
+    limits.max_depth = options.depth;
+    limits.threads = 1;
+    limits.aspiration_window = 32;
+
+    auto report = BitboardTraceReport{};
+    report.seed = options.seed;
+    report.games_requested = options.games;
+    report.depth = options.depth;
+    report.alpha = options.alpha;
+    report.lambda = options.lambda;
+    report.epsilon = options.epsilon;
+    report.epsilon_plies = options.epsilon_plies;
+    report.terminal_reward = options.terminal_reward;
+    report.td_error_clip = options.td_error_clip;
+    report.terminal_only_warmup = options.terminal_only_warmup;
+    report.near_terminal_curriculum = options.near_terminal_curriculum;
+
+    const auto curriculum_games = std::max(options.terminal_only_warmup, options.near_terminal_curriculum);
+    for (int game_index = 0; game_index < options.games; ++game_index) {
+        auto position = surakarta::bitboard::Position{};
+        if (game_index < curriculum_games) {
+            position = surakarta::bitboard::BuildNearTerminalTrainingPosition(game_index);
+        } else {
+            LoadBitboardPosition("", position);
+        }
+        surakarta::bitboard::ResetTrainingTraces(traces);
+        auto plies = 0;
+
+        for (;;) {
+            if (IsTraceTerminalPosition(position)) {
+                break;
+            }
+
+            auto legal_moves = surakarta::bitboard::MoveList{};
+            surakarta::bitboard::GenerateMoves(position, legal_moves);
+            if (legal_moves.size == 0) {
+                break;
+            }
+
+            auto chosen_move = surakarta::bitboard::Move{};
+            if (plies < options.epsilon_plies && random_unit(rng) < options.epsilon) {
+                const auto move_index = std::uniform_int_distribution<int>(0, legal_moves.size - 1)(rng);
+                chosen_move = legal_moves.moves[move_index];
+            } else {
+                if (!controller.Evaluator().ApplyWeights(weights)) {
+                    std::cerr << "Failed to apply trace weights to search controller" << std::endl;
+                    return 1;
+                }
+                controller.Table().Clear();
+                const auto result = controller.Search(position, limits);
+                chosen_move = result.best_move.IsValid() ? result.best_move : legal_moves.moves[0];
+            }
+
+            auto next = position;
+            auto undo = surakarta::bitboard::Undo{};
+            surakarta::bitboard::MakeMove(next, chosen_move, undo);
+
+            auto context = surakarta::bitboard::TrainingStepContext{};
+            context.next_is_ply_cap = (plies + 1) >= kTraceTrainingMaxPlies;
+            const auto next_terminal = IsTraceTerminalPosition(next);
+            auto next_legal_moves = surakarta::bitboard::MoveList{};
+            if (!next_terminal && !context.next_is_ply_cap) {
+                surakarta::bitboard::GenerateMoves(next, next_legal_moves);
+                context.next_has_legal_moves = next_legal_moves.size > 0;
+            }
+
+            const auto before_weights = weights.values;
+            auto step_result = surakarta::bitboard::TrainingStepResult{};
+            if (!surakarta::bitboard::ApplyTrainingStep(
+                    weights,
+                    traces,
+                    position,
+                    next,
+                    context,
+                    options.alpha,
+                    options.lambda,
+                    &step_result,
+                    options.terminal_reward,
+                    options.td_error_clip)) {
+                std::cerr << "Failed to apply trace TD step" << std::endl;
+                return 1;
+            }
+
+            auto step = BitboardTraceStep{};
+            step.game_index = game_index;
+            step.ply = plies;
+            step.side_to_move = BitboardColorName(position.SideToMove());
+            step.reward = step_result.terminal_target ? step_result.target_value : 0.0;
+            step.value_before = step_result.current_value;
+            step.value_after = surakarta::bitboard::EvaluateTrainingValueForSideToMove(weights, position);
+            step.bootstrap_value = step_result.terminal_target ? 0.0 : step_result.target_value;
+            step.td_error = step_result.td_error;
+            step.trace_norm = L2Norm(traces);
+            step.weight_delta_norm = L2DeltaNorm(before_weights, weights.values);
+            step.terminal_reason = TraceTerminalReason(next, context);
+            report.steps.push_back(step);
+
+            position = next;
+            ++plies;
+            if (next_terminal || !context.next_has_legal_moves || context.next_is_ply_cap) {
+                break;
+            }
+        }
+    }
+
+    PrintBitboardTraceReport(report, options.format);
+    return 0;
 }
 
 int RunBitboardTrainCommand(int argc, char** argv) {
@@ -702,6 +1458,26 @@ int RunBitboardTrainCommand(int argc, char** argv) {
                 return 1;
             }
             options.epsilon_plies = atoi(argv[i]);
+        } else if (strcmp(argv[i], "--terminal-reward") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return 1;
+            }
+            options.terminal_reward = atof(argv[i]);
+        } else if (strcmp(argv[i], "--td-error-clip") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return 1;
+            }
+            options.td_error_clip = atof(argv[i]);
+        } else if (strcmp(argv[i], "--terminal-only-warmup") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return 1;
+            }
+            options.terminal_only_warmup = atoi(argv[i]);
+        } else if (strcmp(argv[i], "--near-terminal-curriculum") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return 1;
+            }
+            options.near_terminal_curriculum = atoi(argv[i]);
         } else if (strcmp(argv[i], "--seed") == 0) {
             if (!RequireValue(argc, argv, &i, argv[i - 0])) {
                 return 1;
@@ -717,6 +1493,24 @@ int RunBitboardTrainCommand(int argc, char** argv) {
                 return 1;
             }
             options.checkpoint_dir = argv[i];
+        } else if (strcmp(argv[i], "--config") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return 1;
+            }
+            options.active_objective_config_path = argv[i];
+            auto config_file = std::ifstream(options.active_objective_config_path);
+            if (!config_file) {
+                std::cerr << "failed to open config: " << options.active_objective_config_path << std::endl;
+                return 1;
+            }
+            auto config_stream = std::ostringstream{};
+            config_stream << config_file.rdbuf();
+            auto config_error = std::string{};
+            if (!surakarta::bitboard::ParseActiveObjectiveConfigSkeleton(
+                    config_stream.str(), &options.active_objective_config, &config_error)) {
+                std::cerr << "invalid config: " << config_error << std::endl;
+                return 1;
+            }
         } else if (strcmp(argv[i], "--format") == 0 || strcmp(argv[i], "-F") == 0) {
             if (!RequireValue(argc, argv, &i, argv[i - 0])) {
                 return 1;
@@ -736,6 +1530,9 @@ int RunBitboardTrainCommand(int argc, char** argv) {
     auto summary = surakarta::bitboard::TrainingSummary{};
     auto error_message = std::string{};
     if (!surakarta::bitboard::RunBitboardTraining(options, &summary, &error_message)) {
+        if (summary.active_interface_config_present) {
+            PrintTrainingSummary(summary, format);
+        }
         std::cerr << "bitboard-train failed: " << error_message << std::endl;
         return 1;
     }
@@ -787,8 +1584,10 @@ void PrintUsage(const char* executable) {
     std::cout << "Usage: " << executable << " play [args..] [--delay|-D <delay>]" << std::endl;
     std::cout << "       " << executable << " bitboard-search [args..] [--file|-f <board-file>]" << std::endl;
     std::cout << "       " << executable << " bitboard-benchmark [args..] [--movegen-iters|-m <count>]" << std::endl;
+    std::cout << "       " << executable << " bitboard-trace [--games|-g <n>] [--seed <n>] [--format json|csv]" << std::endl;
     std::cout << "       " << executable << " bitboard-train --output|-o <weights.bin> [args..]" << std::endl;
     std::cout << "       " << executable << " bitboard-eval --candidate <weights.bin> [args..]" << std::endl;
+    std::cout << "       " << executable << " bitboard-selftest" << std::endl;
     std::cout << "       " << executable << " statistic [args..] [-j <concurrency>] [-n <total_rounds>]" << std::endl;
     std::cout << "Args:" << std::endl;
     std::cout << "  --depth|-d <depth>  Search depth for bitboard commands, default: 4" << std::endl;
@@ -799,8 +1598,11 @@ void PrintUsage(const char* executable) {
     std::cout << "  --movegen-iters|-m  Move generation iterations for bitboard-benchmark, default: 100000" << std::endl;
     std::cout << "  --format|-F <mode>  Output format: text or json, default: text" << std::endl;
     std::cout << "  --case-id|-c <id>   Optional report case identifier, default: opening or file stem" << std::endl;
-    std::cout << "  bitboard-train args: --weights|-w --games|-g --alpha --lambda --epsilon --epsilon-plies --seed --checkpoint-every --checkpoint-dir" << std::endl;
+    std::cout << "  --search-diagnostics Enable root/aspiration/qsearch diagnostic output for bitboard search commands" << std::endl;
+    std::cout << "  bitboard-trace args: --weights|-w --games|-g --alpha --lambda --epsilon --epsilon-plies --terminal-reward --td-error-clip --terminal-only-warmup --near-terminal-curriculum --seed --format json|csv" << std::endl;
+    std::cout << "  bitboard-train args: --weights|-w --games|-g --alpha --lambda --epsilon --epsilon-plies --terminal-reward --td-error-clip --terminal-only-warmup --near-terminal-curriculum --seed --checkpoint-every --checkpoint-dir --config" << std::endl;
     std::cout << "  bitboard-eval args: --baseline --depth|-d --format|-F" << std::endl;
+    std::cout << "  bitboard-selftest runs the bitboard selftest executable next to this benchmark binary" << std::endl;
 }
 
 int main(int argc, char** argv) {
@@ -851,11 +1653,17 @@ int main(int argc, char** argv) {
     if (command == "bitboard-benchmark") {
         return RunBitboardBenchmarkCommand(argc - 2, argv + 2);
     }
+    if (command == "bitboard-trace") {
+        return RunBitboardTraceCommand(argc - 2, argv + 2);
+    }
     if (command == "bitboard-train") {
         return RunBitboardTrainCommand(argc - 2, argv + 2);
     }
     if (command == "bitboard-eval") {
         return RunBitboardEvalCommand(argc - 2, argv + 2);
+    }
+    if (command == "bitboard-selftest") {
+        return RunBitboardSelftestCommand(argv[0]);
     }
     if (command == "statistic") {
         int depth = SurakartaMoveWeightUtil::DefaultDepth;
