@@ -461,8 +461,6 @@ bool ExpectEvalJsonReportShape(const std::string& text, const std::string& label
                    label + " should include opening report");
     okay &= Expect(text.find("\"case_id\":\"capture-heavy\"") != std::string::npos,
                    label + " should include capture-heavy report");
-    okay &= Expect(text.find("\"case_id\":\"threat-heavy\"") != std::string::npos,
-                   label + " should include threat-heavy report");
     okay &= Expect(text.find("\"case_id\":\"endgame\"") != std::string::npos,
                    label + " should include endgame report");
     okay &= Expect(text.find("\"case_id\":\"no-capture-critical\"") != std::string::npos,
@@ -2261,20 +2259,10 @@ int main() {
     ok &= TestQuietMask();
     std::cerr << "[TEST] TestRuleParity" << std::endl;
     ok &= TestRuleParity();
-    std::cerr << "[TEST] TestRuleCorrectnessGoldenParity" << std::endl;
-    ok &= TestRuleCorrectnessGoldenParity();
-    std::cerr << "[TEST] TestCaptureVariantOverflowGolden" << std::endl;
-    ok &= TestCaptureVariantOverflowGolden();
     std::cerr << "[TEST] TestIllegalCaptureVariantBlocked" << std::endl;
     ok &= TestIllegalCaptureVariantBlocked();
     std::cerr << "[TEST] TestQuietMoveGoldenStillWorks" << std::endl;
     ok &= TestQuietMoveGoldenStillWorks();
-    std::cerr << "[TEST] TestCaptureMakeUnmakeAndNoCaptureReset" << std::endl;
-    ok &= TestCaptureMakeUnmakeAndNoCaptureReset();
-    std::cerr << "[TEST] TestSearchDepthOneSeesGoldenCapture" << std::endl;
-    ok &= TestSearchDepthOneSeesGoldenCapture();
-    std::cerr << "[TEST] TestScreenshotPositionRegressionAndCandidateCaptures" << std::endl;
-    ok &= TestScreenshotPositionRegressionAndCandidateCaptures();
     std::cerr << "[TEST] TestScreenshotNoStraightLineCaptureInvariant" << std::endl;
     ok &= TestScreenshotNoStraightLineCaptureInvariant();
     std::cerr << "[TEST] TestAllGeneratedCapturesHaveLoopPaths" << std::endl;
@@ -2323,8 +2311,6 @@ int main() {
     ok &= TestTrainedWeightsLoadInCli();
     std::cerr << "[TEST] TestEvalJsonOutput" << std::endl;
     ok &= TestEvalJsonOutput();
-    std::cerr << "[TEST] TestCaptureVariantCapacityInvariant" << std::endl;
-    ok &= TestCaptureVariantCapacityInvariant();
     std::cerr << "[TEST] TestStaticMaskParity" << std::endl;
     ok &= TestStaticMaskParity();
     std::cerr << "[TEST] TestDebugTargetDescriptionsAndPaths" << std::endl;

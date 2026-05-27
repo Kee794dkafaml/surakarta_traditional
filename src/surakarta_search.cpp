@@ -2644,11 +2644,9 @@ bool RunBitboardEvaluation(const EvalOptions& options,
 
         const auto limits = NormalizeSingleThreadLimits(options.limits);
         const auto capture_heavy_path = ResolveEvaluationDataPath("game1.txt");
-        const auto threat_heavy_path = ResolveEvaluationDataPath("game10.txt");
         const auto endgame_path = ResolveEvaluationDataPath("game6.txt");
         const auto no_capture_critical_path = ResolveEvaluationDataPath("game8.txt");
         if (capture_heavy_path.empty() ||
-            threat_heavy_path.empty() ||
             endgame_path.empty() ||
             no_capture_critical_path.empty()) {
             SetErrorMessage(error_message, "failed to resolve benchmark test positions");
@@ -2660,10 +2658,9 @@ bool RunBitboardEvaluation(const EvalOptions& options,
         local_report.baseline_weights = baseline_label;
         local_report.depth = limits.max_depth;
 
-        const auto cases = std::array<std::pair<std::string, std::string>, 5>{
+        const auto cases = std::array<std::pair<std::string, std::string>, 4>{
             std::pair<std::string, std::string>{"opening", ""},
             {"capture-heavy", capture_heavy_path.string()},
-            {"threat-heavy", threat_heavy_path.string()},
             {"endgame", endgame_path.string()},
             {"no-capture-critical", no_capture_critical_path.string()},
         };
