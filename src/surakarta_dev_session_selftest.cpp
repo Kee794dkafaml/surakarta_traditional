@@ -1,5 +1,7 @@
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -145,6 +147,13 @@ bool HasCurveFragment(const std::vector<SurakartaMovePathFragment>& path) {
 
 std::string ScreenshotSameFileCaptureGoldenFile() {
     return std::string(BITBOARD_TEST_DATA_DIR) + "\\screenshot_2026_05_06_same_file_capture.txt";
+}
+
+std::filesystem::path WriteTempBoardFile(const std::string& name, const std::string& contents) {
+    const auto path = std::filesystem::temp_directory_path() / name;
+    auto output = std::ofstream(path);
+    output << contents;
+    return path;
 }
 
 bool TestCoordinateConventionIsFileThenRank() {
@@ -419,6 +428,67 @@ bool TestTerminalStatusUsesSharedRuleEvaluation() {
     return okay;
 }
 
+bool TestTerminalStatusUsesNationalNoCaptureSemantics() {
+    const auto stalemate_path = WriteTempBoardFile(
+        "surakarta-national-stalemate-status.txt",
+        "B B W . . . \n"
+        ". . . . . . \n"
+        ". . . . . . \n"
+        ". . . . . . \n"
+        ". . . . . . \n"
+        ". . . . . . \n"
+        "current_player: B\n"
+        "num_round: 1\n"
+        "last_captured_round: 0\n"
+        "end_reason: NONE\n"
+        "winner: .\n"
+        "max_no_capture_round: 40\n");
+    const auto legacy_counter_path = WriteTempBoardFile(
+        "surakarta-national-counter-not-terminal.txt",
+        ". . . . . . \n"
+        "B . . . . . \n"
+        ". . . . . . \n"
+        ". . . . . . \n"
+        "W . . . . . \n"
+        ". . . . . . \n"
+        "current_player: B\n"
+        "num_round: 50\n"
+        "last_captured_round: 0\n"
+        "end_reason: NONE\n"
+        "winner: .\n"
+        "max_no_capture_round: 1\n");
+
+    auto okay = true;
+    {
+        auto session = DevelopmentSession{};
+        std::string error;
+        okay &= Expect(session.LoadFromFile(stalemate_path.string(), &error), error);
+        const auto status = session.Status();
+        okay &= Expect(status.terminal, "national no-capture stalemate should mark the session as terminal");
+        okay &= Expect(status.end_reason == SurakartaEndReason::STALEMATE,
+                       "national no-capture stalemate should report STALEMATE");
+        okay &= Expect(status.winner == SurakartaPlayer::BLACK,
+                       "national no-capture stalemate should award the material leader");
+    }
+    {
+        auto session = DevelopmentSession{};
+        std::string error;
+        okay &= Expect(session.LoadFromFile(legacy_counter_path.string(), &error), error);
+        const auto status = session.Status();
+        okay &= Expect(!status.terminal,
+                       "legacy no-capture counter alone should not mark a capture-available position terminal");
+        okay &= Expect(status.end_reason == SurakartaEndReason::NONE,
+                       "capture-available legacy no-capture fixture should keep NONE end reason");
+        okay &= Expect(status.winner == SurakartaPlayer::NONE,
+                       "capture-available legacy no-capture fixture should keep NONE winner");
+    }
+
+    std::error_code ignored;
+    std::filesystem::remove(stalemate_path, ignored);
+    std::filesystem::remove(legacy_counter_path, ignored);
+    return okay;
+}
+
 }  // namespace
 
 int main() {
@@ -436,6 +506,7 @@ int main() {
     okay &= TestLiveSnapshotCarriesPrincipalVariationAndCounters();
     okay &= TestSnapshotClearsAfterSearchCancellation();
     okay &= TestTerminalStatusUsesSharedRuleEvaluation();
+    okay &= TestTerminalStatusUsesNationalNoCaptureSemantics();
     if (okay) {
         std::cout << "[PASS] surakarta-dev-session-selftest" << std::endl;
         return EXIT_SUCCESS;

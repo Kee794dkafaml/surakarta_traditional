@@ -358,6 +358,14 @@ struct RootSearchResult {
     int diagnostic_event_id{-1};
 };
 
+struct OpeningSafeObjectiveSkeletonState {
+    bool active{false};
+    double value{0.0};
+    std::string scope_status{"inactive"};
+    bool hard_reject_triggered{false};
+    bool selection_gate_eligible{false};
+};
+
 int TotalWeightCount();
 Color WinnerColorFromPosition(const Position& position);
 
@@ -538,6 +546,16 @@ double EvaluateWeightsForSideToMove(const NTupleWeights& weights, const Position
     return position.SideToMove() == Color::Black ? score : -score;
 }
 
+std::string SearchTerminalReason(const Position& position) {
+    if (position.board.Count(Color::Black) == 0 || position.board.Count(Color::White) == 0) {
+        return "terminal";
+    }
+    if (IsNationalStalemateTerminal(position)) {
+        return "both_sides_cannot_capture";
+    }
+    return "terminal";
+}
+
 std::int32_t QuantizeWeight(double value) {
     return static_cast<std::int32_t>(std::llround(std::clamp(value, -kTrainingWeightClamp, kTrainingWeightClamp)));
 }
@@ -553,12 +571,49 @@ double TrainingTargetFromAfterMove(const Position& position_after_move,
     if (position_after_move.board.Count(mover) == 0) {
         return TrainingTerminalTarget(enemy, mover, terminal_reward);
     }
-    if (position_after_move.no_capture_ply >= position_after_move.max_no_capture_round ||
+    if (IsNationalStalemateTerminal(position_after_move) ||
         !context.next_has_legal_moves ||
         context.next_is_ply_cap) {
         return TrainingTerminalTarget(WinnerColorFromPosition(position_after_move), mover, terminal_reward);
     }
     return std::numeric_limits<double>::quiet_NaN();
+}
+
+OpeningSafeObjectiveSkeletonState BuildOpeningSafeObjectiveSkeletonState(const TrainingOptions& options,
+                                                                         const Position& current) {
+    auto state = OpeningSafeObjectiveSkeletonState{};
+    if (!options.opening_safe_objective_enabled) {
+        return state;
+    }
+    if (options.opening_drift_penalty_hard_reject) {
+        state.hard_reject_triggered = true;
+        state.scope_status = "hard_reject_report_only";
+        return state;
+    }
+    if (options.opening_drift_penalty_weight <= 0.0) {
+        state.scope_status = "zero_weight";
+        return state;
+    }
+    if (options.opening_drift_penalty_root_case_id.empty() ||
+        options.opening_drift_penalty_max_ply_window <= 0 ||
+        current.ply > options.opening_drift_penalty_max_ply_window) {
+        state.scope_status = "out_of_scope";
+        return state;
+    }
+    if (options.opening_drift_penalty_unsafe_rank_degradation <= 0.0) {
+        state.scope_status = "no_unsafe_rank_degradation";
+        return state;
+    }
+    if (options.opening_drift_penalty_root_cost_multiplier <= 0.0) {
+        state.scope_status = "no_root_cost";
+        return state;
+    }
+    state.active = true;
+    state.value = options.opening_drift_penalty_weight *
+                  options.opening_drift_penalty_unsafe_rank_degradation *
+                  options.opening_drift_penalty_root_cost_multiplier;
+    state.scope_status = "active_scoped";
+    return state;
 }
 
 std::string FormatMoveForPosition(const Position& position, Move move) {
@@ -607,7 +662,7 @@ int EvaluateTerminal(const Position& position) {
     if (position.board.Count(enemy) == 0) {
         return kMateScore - position.ply;
     }
-    if (position.no_capture_ply >= position.max_no_capture_round) {
+    if (IsNationalStalemateTerminal(position)) {
         const int score = MaterialBalance(position);
         return side == Color::Black ? score : -score;
     }
@@ -1336,6 +1391,16 @@ SearchResult SearchDepthAttempt(SearchController& controller,
                                 Move preferred_root_move) {
     shared.current_depth.store(depth, std::memory_order_relaxed);
 
+    const int terminal = EvaluateTerminal(root);
+    if (terminal != std::numeric_limits<int>::min()) {
+        auto result = SearchResult{};
+        result.depth = depth;
+        result.score = terminal;
+        result.stats = shared.Stats();
+        shared.PublishResult(result);
+        return result;
+    }
+
     auto root_moves = MoveList{};
     GenerateMoves(root, root_moves);
     if (root_moves.size == 0) {
@@ -1635,7 +1700,9 @@ bool ApplyTrainingStep(NTupleWeights& weights,
                        double lambda,
                        TrainingStepResult* result,
                        double terminal_reward,
-                       double td_error_clip) {
+                       double td_error_clip,
+                       const TrainingOptions& options) {
+    const auto objective_state = BuildOpeningSafeObjectiveSkeletonState(options, current);
     if (traces.size() != weights.values.size()) {
         return false;
     }
@@ -1648,6 +1715,9 @@ bool ApplyTrainingStep(NTupleWeights& weights,
     const auto terminal_target = !std::isnan(target_value);
     if (!terminal_target) {
         target_value = -EvaluateTrainingValueForSideToMove(weights, next);
+    }
+    if (objective_state.active) {
+        target_value -= objective_state.value;
     }
 
     for (auto& trace : traces) {
@@ -1688,6 +1758,11 @@ bool ApplyTrainingStep(NTupleWeights& weights,
         result->abs_weight_delta = step_abs_weight_delta;
         result->changed_weight_count = changed_weight_count;
         result->terminal_target = terminal_target;
+        result->opening_drift_penalty_active = objective_state.active;
+        result->opening_drift_penalty_value = objective_state.value;
+        result->opening_drift_penalty_scope_status = objective_state.scope_status;
+        result->hard_reject_triggered = objective_state.hard_reject_triggered;
+        result->selection_gate_eligible = objective_state.selection_gate_eligible;
     }
     return true;
 }
@@ -2220,7 +2295,7 @@ EvalMatchGame PlayEvaluationMatchGame(const std::string& case_id,
     for (;;) {
         const int terminal = EvaluateTerminal(position);
         if (terminal != std::numeric_limits<int>::min()) {
-            report.final_reason = position.no_capture_ply >= position.max_no_capture_round ? "no_capture_limit" : "terminal";
+            report.final_reason = SearchTerminalReason(position);
             break;
         }
 
@@ -2379,6 +2454,22 @@ bool RunBitboardTraining(const TrainingOptions& options,
         SetErrorMessage(error_message, "near-terminal curriculum must be non-negative");
         return false;
     }
+    if (options.opening_drift_penalty_weight < 0.0) {
+        SetErrorMessage(error_message, "drift penalty weight must be non-negative");
+        return false;
+    }
+    if (options.opening_drift_penalty_max_ply_window < 0) {
+        SetErrorMessage(error_message, "drift penalty ply window must be non-negative");
+        return false;
+    }
+    if (options.opening_drift_penalty_unsafe_rank_degradation < 0.0) {
+        SetErrorMessage(error_message, "drift penalty unsafe rank degradation must be non-negative");
+        return false;
+    }
+    if (options.opening_drift_penalty_root_cost_multiplier < 0.0) {
+        SetErrorMessage(error_message, "drift penalty root cost multiplier must be non-negative");
+        return false;
+    }
     if (options.active_objective_config.config_present && !options.active_objective_config.config_valid) {
         SetErrorMessage(error_message,
                         "active objective config rejected: " + options.active_objective_config.reject_reason);
@@ -2391,12 +2482,6 @@ bool RunBitboardTraining(const TrainingOptions& options,
     }
 
     try {
-        auto weights = BootstrapWeights();
-        if (!options.input_weights_path.empty() && !weights.LoadBinary(options.input_weights_path)) {
-            SetErrorMessage(error_message, "failed to load input weights: " + options.input_weights_path);
-            return false;
-        }
-
         const auto limits = NormalizeSingleThreadLimits(options.limits);
         auto local_summary = TrainingSummary{};
         local_summary.games_requested = options.games;
@@ -2448,12 +2533,25 @@ bool RunBitboardTraining(const TrainingOptions& options,
         } else {
             local_summary.active_interface_config_status = "default_off";
         }
+        const auto objective_state =
+            BuildOpeningSafeObjectiveSkeletonState(options, LoadPositionFromFileOrDefault(""));
+        local_summary.opening_safe_objective_enabled = options.opening_safe_objective_enabled;
+        local_summary.opening_drift_penalty_active = objective_state.active;
+        local_summary.opening_drift_penalty_value = objective_state.value;
+        local_summary.opening_drift_penalty_scope_status = objective_state.scope_status;
+        local_summary.inactive_path_equivalent = !objective_state.active;
 
         if (no_output_probe_mode) {
             if (summary != nullptr) {
                 *summary = local_summary;
             }
             return true;
+        }
+
+        auto weights = BootstrapWeights();
+        if (!options.input_weights_path.empty() && !weights.LoadBinary(options.input_weights_path)) {
+            SetErrorMessage(error_message, "failed to load input weights: " + options.input_weights_path);
+            return false;
         }
 
         if (options.games == 0) {
@@ -2485,7 +2583,7 @@ bool RunBitboardTraining(const TrainingOptions& options,
             for (;;) {
                 if (EvaluateTerminal(position) != std::numeric_limits<int>::min()) {
                     const auto winner = WinnerColorFromPosition(position);
-                    if (position.no_capture_ply >= position.max_no_capture_round) {
+                    if (IsNationalStalemateTerminal(position)) {
                         AccumulateNoCaptureTerminal(winner, local_summary);
                     } else {
                         AccumulateCheckmateTerminal(winner, local_summary);
@@ -2534,7 +2632,8 @@ bool RunBitboardTraining(const TrainingOptions& options,
                                        options.lambda,
                                        &step_result,
                                        options.terminal_reward,
-                                       options.td_error_clip)) {
+                                       options.td_error_clip,
+                                       options)) {
                     SetErrorMessage(error_message, "failed to apply training td step");
                     return false;
                 }
@@ -2550,7 +2649,7 @@ bool RunBitboardTraining(const TrainingOptions& options,
                 ++plies;
                 if (next_terminal) {
                     const auto winner = WinnerColorFromPosition(position);
-                    if (position.no_capture_ply >= position.max_no_capture_round) {
+                    if (IsNationalStalemateTerminal(position)) {
                         AccumulateNoCaptureTerminal(winner, local_summary);
                     } else {
                         AccumulateCheckmateTerminal(winner, local_summary);

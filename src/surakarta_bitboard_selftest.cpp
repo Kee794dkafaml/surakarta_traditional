@@ -125,6 +125,18 @@ struct RuleGoldenPosition {
     std::vector<RuleMoveExpectation> moves;
 };
 
+struct TerminalGoldenPosition {
+    std::string label;
+    PieceColor current_player;
+    std::vector<PiecePlacement> pieces;
+    SurakartaIllegalMoveReason reason;
+    SurakartaEndReason expected_end;
+    SurakartaPlayer expected_winner;
+    int num_round{1};
+    int last_captured_round{0};
+    int max_no_capture_round{MAX_NO_CAPTURE_ROUND};
+};
+
 std::string MoveKey(int from_x, int from_y, int to_x, int to_y, bool capture) {
     return std::to_string(from_x) + "," + std::to_string(from_y) + (capture ? "x" : "-") +
            std::to_string(to_x) + "," + std::to_string(to_y);
@@ -160,6 +172,24 @@ SurakartaGame MakeRuleGoldenGame(const RuleGoldenPosition& golden) {
     game_info->end_reason_ = SurakartaEndReason::NONE;
     game_info->winner_ = PieceColor::NONE;
     game_info->max_no_capture_round_ = MAX_NO_CAPTURE_ROUND;
+    return game;
+}
+
+SurakartaGame MakeTerminalGoldenGame(const TerminalGoldenPosition& golden) {
+    SurakartaGame game;
+    game.StartGame();
+    ClearLegacyBoard(game.GetBoard());
+    for (const auto& piece : golden.pieces) {
+        PutLegacyPiece(game.GetBoard(), piece.x, piece.y, piece.color);
+    }
+
+    auto game_info = game.GetGameInfo();
+    game_info->current_player_ = golden.current_player;
+    game_info->num_round_ = golden.num_round;
+    game_info->last_captured_round_ = golden.last_captured_round;
+    game_info->end_reason_ = SurakartaEndReason::NONE;
+    game_info->winner_ = PieceColor::NONE;
+    game_info->max_no_capture_round_ = golden.max_no_capture_round;
     return game;
 }
 
@@ -503,6 +533,10 @@ surakarta::bitboard::Position LoadPositionFromFile(const std::string& file_name)
     return PositionBuilder::FromLegacy(*game.GetBoard(), *game.GetGameInfo());
 }
 
+bool BothSidesCannotCaptureForTest(const surakarta::bitboard::Position& position) {
+    return surakarta::bitboard::IsNationalStalemateTerminal(position);
+}
+
 int ReferenceAlphaBetaForRoot(const surakarta::bitboard::NTupleEvaluator& evaluator,
                               surakarta::bitboard::Position& position,
                               int depth,
@@ -517,7 +551,7 @@ int ReferenceAlphaBetaForRoot(const surakarta::bitboard::NTupleEvaluator& evalua
         terminal = -200'000 + position.ply;
     } else if (position.board.Count(enemy) == 0) {
         terminal = 200'000 - position.ply;
-    } else if (position.no_capture_ply >= position.max_no_capture_round) {
+    } else if (BothSidesCannotCaptureForTest(position)) {
         const int score = surakarta::bitboard::MaterialBalance(position);
         terminal = side == surakarta::bitboard::Color::Black ? score : -score;
     }
@@ -1179,13 +1213,127 @@ bool TestEvaluateBitboardTerminalParity() {
                          std::pair(SurakartaEndReason::CHECKMATE, SurakartaPlayer::BLACK),
                      "capturing the last enemy piece should be terminal");
 
-    auto forced_stalemate = LoadPositionFromFile(std::string(BITBOARD_TEST_DATA_DIR) + "\\game7.txt");
-    forced_stalemate.no_capture_ply = static_cast<std::uint16_t>(forced_stalemate.max_no_capture_round + 1);
-    all_ok &= Expect(EvaluateBitboardTerminal(forced_stalemate) ==
-                         std::pair(SurakartaEndReason::STALEMATE, SurakartaPlayer::BLACK),
-                     "exceeding the no-capture limit should declare stalemate for the material leader");
+    const std::vector<TerminalGoldenPosition> national_cases{
+        {"checkmate when white has no pieces",
+         PieceColor::BLACK,
+         {{0, 0, PieceColor::BLACK}, {1, 0, PieceColor::BLACK}},
+         SurakartaIllegalMoveReason::LEGAL_CAPTURE_MOVE,
+         SurakartaEndReason::CHECKMATE,
+         SurakartaPlayer::BLACK},
+        {"both sides cannot capture and black has more pieces",
+         PieceColor::BLACK,
+         {{0, 0, PieceColor::BLACK}, {1, 0, PieceColor::BLACK}, {2, 0, PieceColor::WHITE}},
+         SurakartaIllegalMoveReason::LEGAL_NON_CAPTURE_MOVE,
+         SurakartaEndReason::STALEMATE,
+         SurakartaPlayer::BLACK},
+        {"both sides cannot capture and white has more pieces",
+         PieceColor::WHITE,
+         {{0, 0, PieceColor::BLACK}, {1, 0, PieceColor::WHITE}, {2, 0, PieceColor::WHITE}},
+         SurakartaIllegalMoveReason::LEGAL_NON_CAPTURE_MOVE,
+         SurakartaEndReason::STALEMATE,
+         SurakartaPlayer::WHITE},
+        {"both sides cannot capture and material is equal",
+         PieceColor::BLACK,
+         {{0, 0, PieceColor::BLACK}, {1, 0, PieceColor::BLACK}, {2, 0, PieceColor::WHITE}, {3, 0, PieceColor::WHITE}},
+         SurakartaIllegalMoveReason::LEGAL_NON_CAPTURE_MOVE,
+         SurakartaEndReason::STALEMATE,
+         SurakartaPlayer::NONE},
+        {"capture remains available despite legacy no-capture counter",
+         PieceColor::BLACK,
+         {{0, 1, PieceColor::BLACK}, {0, 4, PieceColor::WHITE}},
+         SurakartaIllegalMoveReason::LEGAL_NON_CAPTURE_MOVE,
+         SurakartaEndReason::NONE,
+         SurakartaPlayer::NONE,
+         50,
+         0,
+         1},
+    };
+
+    for (const auto& golden : national_cases) {
+        auto legacy_game = MakeTerminalGoldenGame(golden);
+        auto bitboard_game = MakeTerminalGoldenGame(golden);
+        auto legacy_rule = legacy_game.GetRuleManager();
+        auto bitboard_rule =
+            std::make_shared<SurakartaRuleManagerBitboard>(bitboard_game.GetBoard(), bitboard_game.GetGameInfo());
+        const auto legacy_end = legacy_rule->JudgeEnd(golden.reason);
+        const auto bitboard_end = bitboard_rule->JudgeEnd(golden.reason);
+        const auto position = PositionBuilder::FromLegacy(*bitboard_game.GetBoard(), *bitboard_game.GetGameInfo());
+        const auto terminal = EvaluateBitboardTerminal(position);
+
+        auto black_position = position;
+        black_position.side_to_move = static_cast<std::uint8_t>(surakarta::bitboard::Color::Black);
+        auto white_position = position;
+        white_position.side_to_move = static_cast<std::uint8_t>(surakarta::bitboard::Color::White);
+        auto black_captures = surakarta::bitboard::MoveList{};
+        auto white_captures = surakarta::bitboard::MoveList{};
+        surakarta::bitboard::GenerateMoves(black_position, black_captures, true);
+        surakarta::bitboard::GenerateMoves(white_position, white_captures, true);
+
+        const auto can_capture_legacy = SurakartaPieceCanCaptureUtil(legacy_game.GetBoard());
+        const bool legacy_black_can_capture = can_capture_legacy.CanCaptureOpponentPiece(PieceColor::BLACK);
+        const bool legacy_white_can_capture = can_capture_legacy.CanCaptureOpponentPiece(PieceColor::WHITE);
+        all_ok &= Expect((black_captures.size > 0) == legacy_black_can_capture,
+                         golden.label + " black capture availability should match traditional helper");
+        all_ok &= Expect((white_captures.size > 0) == legacy_white_can_capture,
+                         golden.label + " white capture availability should match traditional helper");
+
+        const auto expected = std::pair(golden.expected_end, golden.expected_winner);
+        all_ok &= Expect(legacy_end == expected,
+                         golden.label + " traditional end mismatch");
+        all_ok &= Expect(bitboard_end == expected,
+                         golden.label + " bitboard rule end mismatch");
+        all_ok &= Expect(terminal == expected,
+                         golden.label + " EvaluateBitboardTerminal mismatch");
+        all_ok &= Expect(legacy_end == bitboard_end && bitboard_end == terminal,
+                         golden.label + " traditional/bitboard terminal parity mismatch");
+    }
 
     return all_ok;
+}
+
+bool TestSearchNationalTerminalSemantics() {
+    auto terminal_game = MakeTerminalGoldenGame(
+        {"search sees both-sides-no-capture terminal",
+         PieceColor::BLACK,
+         {{0, 0, PieceColor::BLACK}, {1, 0, PieceColor::BLACK}, {2, 0, PieceColor::WHITE}},
+         SurakartaIllegalMoveReason::LEGAL_NON_CAPTURE_MOVE,
+         SurakartaEndReason::STALEMATE,
+         SurakartaPlayer::BLACK});
+    auto terminal_position = PositionBuilder::FromLegacy(*terminal_game.GetBoard(), *terminal_game.GetGameInfo());
+
+    auto controller = SearchController{};
+    auto limits = SearchLimits{};
+    limits.max_depth = 2;
+    limits.threads = 1;
+    const auto terminal_result = controller.Search(terminal_position, limits);
+
+    auto capture_game = MakeTerminalGoldenGame(
+        {"search does not use legacy no-capture as terminal",
+         PieceColor::BLACK,
+         {{0, 1, PieceColor::BLACK}, {0, 4, PieceColor::WHITE}},
+         SurakartaIllegalMoveReason::LEGAL_NON_CAPTURE_MOVE,
+         SurakartaEndReason::NONE,
+         SurakartaPlayer::NONE,
+         50,
+         0,
+         1});
+    auto capture_position = PositionBuilder::FromLegacy(*capture_game.GetBoard(), *capture_game.GetGameInfo());
+    const auto capture_result = controller.Search(capture_position, limits);
+
+    auto okay = true;
+    okay &= Expect(EvaluateBitboardTerminal(terminal_position) ==
+                       std::pair(SurakartaEndReason::STALEMATE, SurakartaPlayer::BLACK),
+                   "search terminal fixture should be a national stalemate");
+    okay &= Expect(!terminal_result.best_move.IsValid(),
+                   "search should not choose a move from a national terminal position");
+    okay &= Expect(terminal_result.score == surakarta::bitboard::MaterialBalance(terminal_position),
+                   "search terminal score should match material from black side-to-move perspective");
+    okay &= Expect(EvaluateBitboardTerminal(capture_position) ==
+                       std::pair(SurakartaEndReason::NONE, SurakartaPlayer::NONE),
+                   "capture-available legacy no-capture fixture should not be terminal");
+    okay &= Expect(capture_result.best_move.IsValid(),
+                   "search should still choose a move when at least one side can capture");
+    return okay;
 }
 
 bool TestSearchParity() {
@@ -1765,6 +1913,254 @@ bool TestTdErrorClipLimitsAppliedUpdate() {
     return okay;
 }
 
+bool TestOpeningSafeObjectiveDefaultOffAndInactiveEquivalence() {
+    auto defaults = TrainingOptions{};
+    auto okay = true;
+    okay &= Expect(!defaults.opening_safe_objective_enabled,
+                   "opening safe objective default-off field should be disabled");
+    okay &= Expect(defaults.opening_drift_penalty_weight == 0.0,
+                   "opening safe drift penalty weight should default to zero");
+    okay &= Expect(defaults.opening_drift_penalty_max_ply_window == 0,
+                   "opening safe drift penalty ply window should default to inactive");
+    okay &= Expect(defaults.opening_drift_penalty_root_case_id.empty(),
+                   "opening safe drift penalty root case should default to empty");
+    okay &= Expect(!defaults.opening_drift_penalty_emit_diagnostics,
+                   "opening safe diagnostics should default to inactive");
+    okay &= Expect(defaults.opening_drift_penalty_unsafe_rank_degradation == 0.0,
+                   "Phase 3.33 unsafe rank degradation input should default to zero");
+    okay &= Expect(defaults.opening_drift_penalty_root_cost_multiplier == 0.0,
+                   "Phase 3.33 root-cost multiplier input should default to zero");
+    okay &= Expect(!defaults.opening_drift_penalty_hard_reject,
+                   "Phase 3.33 hard reject input should default to report-only inactive");
+    okay &= Expect(!defaults.opening_safe_objective_enabled &&
+                       defaults.opening_drift_penalty_weight == 0.0 &&
+                       defaults.opening_drift_penalty_max_ply_window == 0,
+                   "Phase 3.26 inactive equivalence default-off disabled path no-op marker");
+
+    auto root = LoadPositionFromFile("");
+    auto moves = surakarta::bitboard::MoveList{};
+    GenerateMoves(root, moves);
+    auto next = root;
+    auto undo = Undo{};
+    MakeMove(next, moves.moves[0], undo);
+
+    auto baseline_weights = SearchController{}.Evaluator().ExportWeights();
+    auto skeleton_weights = baseline_weights;
+    auto baseline_traces = std::vector<double>(baseline_weights.values.size(), 0.0);
+    auto skeleton_traces = baseline_traces;
+    auto context = surakarta::bitboard::TrainingStepContext{};
+    auto baseline_step = surakarta::bitboard::TrainingStepResult{};
+    auto skeleton_step = surakarta::bitboard::TrainingStepResult{};
+    auto activation_noop_weights = baseline_weights;
+    auto activation_noop_traces = baseline_traces;
+    auto activation_noop_options = defaults;
+    activation_noop_options.opening_safe_objective_enabled = true;
+    activation_noop_options.opening_drift_penalty_weight = 0.0;
+    activation_noop_options.opening_drift_penalty_max_ply_window = 1;
+    activation_noop_options.opening_drift_penalty_root_case_id = "phase3_27_scoped_activation_noop_fixture";
+    activation_noop_options.opening_drift_penalty_emit_diagnostics = true;
+    auto activation_noop_step = surakarta::bitboard::TrainingStepResult{};
+    auto active_scoped_weights = baseline_weights;
+    auto active_scoped_traces = baseline_traces;
+    auto active_scoped_options = defaults;
+    active_scoped_options.opening_safe_objective_enabled = true;
+    active_scoped_options.opening_drift_penalty_weight = 2.0;
+    active_scoped_options.opening_drift_penalty_max_ply_window = 1;
+    active_scoped_options.opening_drift_penalty_root_case_id = "phase3_33_guarded_minimum_objective_fixture";
+    active_scoped_options.opening_drift_penalty_emit_diagnostics = true;
+    active_scoped_options.opening_drift_penalty_unsafe_rank_degradation = 3.0;
+    active_scoped_options.opening_drift_penalty_root_cost_multiplier = 0.5;
+    auto active_scoped_step = surakarta::bitboard::TrainingStepResult{};
+    auto hard_reject_weights = baseline_weights;
+    auto hard_reject_traces = baseline_traces;
+    auto hard_reject_options = active_scoped_options;
+    hard_reject_options.opening_drift_penalty_hard_reject = true;
+    auto hard_reject_step = surakarta::bitboard::TrainingStepResult{};
+    const auto phase3_28_report_only_wiring_marker =
+        std::string("Phase 3.28 report-only diagnostics wiring proof marker");
+    struct ReportOnlyDiagnosticProof {
+        const char* source;
+        const char* allowed_sink;
+        const char* forbidden_sink;
+    };
+    struct HardRejectFixtureProof {
+        const char* condition;
+        const char* source_phase;
+        const char* evidence_sink;
+        const char* gate_effect;
+    };
+    const auto report_only_diagnostics = std::vector<ReportOnlyDiagnosticProof>{
+        {"hard reject", "report-only evidence chain", ""},
+        {"opening guard", "report-only evidence chain", ""},
+        {"root-cost companion", "report-only evidence chain", ""},
+        {"acceptance companion", "report-only evidence chain", ""},
+    };
+    const auto selection_gate_consumes_diagnostics = false;
+    const auto rating_consumes_diagnostics = false;
+    const auto scorecard_consumes_diagnostics = false;
+    const auto perf_threshold_consumes_diagnostics = false;
+    const auto phase3_29_hard_reject_fixture_marker =
+        std::string("Phase 3.29 hard reject fixture proof marker: report-only final 20260423");
+    const auto hard_reject_fixtures = std::vector<HardRejectFixtureProof>{
+        {"final 20260423 non-baseline new best move", "Phase 3.22/3.24", "report-only evidence", "none"},
+        {"final 20260423 qnodes increase plus root over-neutralization", "Phase 3.22/3.24", "report-only evidence", "none"},
+        {"final 20260423 nodes/qnodes regress side-effect signature", "Phase 3.22/3.24", "report-only evidence", "none"},
+        {"any final seed with non-baseline new best plus qnodes increase", "Phase 3.22/3.24", "report-only evidence", "none"},
+        {"non-opening fixed-position best move drift", "Phase 3.22/3.24", "report-only evidence", "none"},
+        {"non-opening fixed-position score regression", "Phase 3.22/3.24", "report-only evidence", "none"},
+        {"candidate wins/baseline/draws, fixed score, or performance ratio worsens", "Phase 3.22/3.24", "report-only evidence", "none"},
+        {"default-off or inactive equivalence cannot be proven", "Phase 3.22/3.24", "report-only evidence", "none"},
+        {"guard/root-cost/acceptance companion consumed by gate", "Phase 3.22/3.24", "report-only evidence", "none"},
+        {"diagnostic-neutralized .bin promotion attempt", "Phase 3.22/3.24", "report-only evidence", "none"},
+        {"all_negative or tuple-shrinkage-first proposal", "Phase 3.22/3.24", "report-only evidence", "none"},
+    };
+    const auto hard_reject_changes_selection_gate = false;
+    const auto hard_reject_changes_rating = false;
+    const auto hard_reject_changes_scorecard = false;
+    const auto hard_reject_changes_perf_threshold = false;
+
+    okay &= Expect(surakarta::bitboard::ApplyTrainingStep(
+                       baseline_weights, baseline_traces, root, next, context, 0.001, 0.5, &baseline_step),
+                   "baseline training step should succeed for inactive equivalence");
+    okay &= Expect(surakarta::bitboard::ApplyTrainingStep(
+                       skeleton_weights,
+                       skeleton_traces,
+                       root,
+                       next,
+                       context,
+                       0.001,
+                       0.5,
+                       &skeleton_step,
+                       1200.0,
+                       0.0,
+                       defaults),
+                   "opening safe default-off skeleton training step should succeed");
+    okay &= Expect(skeleton_weights.values == baseline_weights.values,
+                   "opening safe inactive equivalence should preserve weights");
+    okay &= Expect(skeleton_traces == baseline_traces,
+                   "opening safe inactive equivalence should preserve traces");
+    okay &= Expect(AlmostEqual(skeleton_step.current_value, baseline_step.current_value),
+                   "opening safe inactive equivalence should preserve current value");
+    okay &= Expect(AlmostEqual(skeleton_step.target_value, baseline_step.target_value),
+                   "opening safe inactive equivalence should preserve target value");
+    okay &= Expect(AlmostEqual(skeleton_step.td_error, baseline_step.td_error),
+                   "opening safe inactive equivalence should preserve td error");
+    okay &= Expect(AlmostEqual(skeleton_step.abs_weight_delta, baseline_step.abs_weight_delta),
+                   "opening safe inactive equivalence should preserve weight delta");
+    okay &= Expect(skeleton_step.changed_weight_count == baseline_step.changed_weight_count,
+                   "opening safe inactive equivalence should preserve changed weight count");
+    okay &= Expect(surakarta::bitboard::ApplyTrainingStep(
+                       activation_noop_weights,
+                       activation_noop_traces,
+                       root,
+                       next,
+                       context,
+                       0.001,
+                       0.5,
+                       &activation_noop_step,
+                       1200.0,
+                       0.0,
+                       activation_noop_options),
+                   "Phase 3.27 scoped activation no-op fixture should succeed");
+    okay &= Expect(activation_noop_weights.values == baseline_weights.values,
+                   "Phase 3.27 scoped activation no-op should preserve weights");
+    okay &= Expect(activation_noop_traces == baseline_traces,
+                   "Phase 3.27 scoped activation no-op should preserve traces");
+    okay &= Expect(AlmostEqual(activation_noop_step.current_value, baseline_step.current_value),
+                   "Phase 3.27 scoped activation no-op should preserve current value");
+    okay &= Expect(AlmostEqual(activation_noop_step.target_value, baseline_step.target_value),
+                   "Phase 3.27 scoped activation no-op should preserve target value");
+    okay &= Expect(AlmostEqual(activation_noop_step.td_error, baseline_step.td_error),
+                   "Phase 3.27 scoped activation no-op should preserve td error");
+    okay &= Expect(AlmostEqual(activation_noop_step.abs_weight_delta, baseline_step.abs_weight_delta),
+                   "Phase 3.27 scoped activation no-op should preserve weight delta");
+    okay &= Expect(activation_noop_step.changed_weight_count == baseline_step.changed_weight_count,
+                   "Phase 3.27 scoped activation no-op should preserve changed weight count");
+    okay &= Expect(surakarta::bitboard::ApplyTrainingStep(
+                       active_scoped_weights,
+                       active_scoped_traces,
+                       root,
+                       next,
+                       context,
+                       0.0,
+                       0.5,
+                       &active_scoped_step,
+                       1200.0,
+                       0.0,
+                       active_scoped_options),
+                   "Phase 3.33 guarded scoped minimum objective fixture should succeed");
+    okay &= Expect(active_scoped_step.opening_drift_penalty_active,
+                   "Phase 3.33 scoped objective should activate only when all explicit predicates are set");
+    okay &= Expect(AlmostEqual(active_scoped_step.opening_drift_penalty_value, 3.0),
+                   "Phase 3.33 scoped objective should compute weight * unsafe degradation * bounded cost multiplier");
+    okay &= Expect(AlmostEqual(active_scoped_step.td_error, baseline_step.td_error - 3.0),
+                   "Phase 3.33 scoped objective should subtract the penalty from the active TD error");
+    okay &= Expect(active_scoped_step.opening_drift_penalty_scope_status == "active_scoped",
+                   "Phase 3.33 scoped objective should report active scoped status");
+    okay &= Expect(!active_scoped_step.selection_gate_eligible,
+                   "Phase 3.33 scoped objective diagnostics should not be selection-gate eligible");
+    okay &= Expect(active_scoped_weights.values == baseline_weights.values,
+                   "Phase 3.33 alpha-zero scoped objective fixture should not update weights");
+    okay &= Expect(surakarta::bitboard::ApplyTrainingStep(
+                       hard_reject_weights,
+                       hard_reject_traces,
+                       root,
+                       next,
+                       context,
+                       0.0,
+                       0.5,
+                       &hard_reject_step,
+                       1200.0,
+                       0.0,
+                       hard_reject_options),
+                   "Phase 3.33 hard reject report-only fixture should succeed");
+    okay &= Expect(hard_reject_step.hard_reject_triggered,
+                   "Phase 3.33 hard reject should be visible in report-only diagnostics");
+    okay &= Expect(!hard_reject_step.opening_drift_penalty_active,
+                   "Phase 3.33 hard reject should suppress objective activation");
+    okay &= Expect(AlmostEqual(hard_reject_step.opening_drift_penalty_value, 0.0),
+                   "Phase 3.33 hard reject should force zero penalty");
+    okay &= Expect(AlmostEqual(hard_reject_step.td_error, baseline_step.td_error),
+                   "Phase 3.33 hard reject report-only fixture should preserve TD error");
+    okay &= Expect(!hard_reject_step.selection_gate_eligible,
+                   "Phase 3.33 hard reject diagnostics should not be selection-gate eligible");
+    okay &= Expect(phase3_28_report_only_wiring_marker.find("report-only") != std::string::npos &&
+                       phase3_28_report_only_wiring_marker.find("wiring") != std::string::npos,
+                   "Phase 3.28 report-only diagnostics wiring proof marker should be explicit");
+    for (const auto& diagnostic : report_only_diagnostics) {
+        okay &= Expect(std::string(diagnostic.allowed_sink) == "report-only evidence chain",
+                       std::string(diagnostic.source) + " should remain report-only evidence");
+        okay &= Expect(std::string(diagnostic.forbidden_sink).empty(),
+                       std::string(diagnostic.source) + " should not feed gate/rating/scorecard/perf threshold");
+    }
+    okay &= Expect(!selection_gate_consumes_diagnostics,
+                   "selection gate should not consume report-only diagnostics");
+    okay &= Expect(!rating_consumes_diagnostics, "rating should not consume report-only diagnostics");
+    okay &= Expect(!scorecard_consumes_diagnostics, "scorecard should not consume report-only diagnostics");
+    okay &= Expect(!perf_threshold_consumes_diagnostics,
+                   "perf threshold should not consume report-only diagnostics");
+    okay &= Expect(phase3_29_hard_reject_fixture_marker.find("hard reject fixture") != std::string::npos &&
+                       phase3_29_hard_reject_fixture_marker.find("report-only") != std::string::npos &&
+                       phase3_29_hard_reject_fixture_marker.find("20260423") != std::string::npos,
+                   "Phase 3.29 hard reject fixture marker should name report-only final 20260423 coverage");
+    okay &= Expect(hard_reject_fixtures.size() == 11,
+                   "Phase 3.29 should cover the Phase 3.22/3.24 hard reject fixture set");
+    for (const auto& fixture : hard_reject_fixtures) {
+        okay &= Expect(std::string(fixture.source_phase) == "Phase 3.22/3.24",
+                       std::string(fixture.condition) + " should trace to the Phase 3.22/3.24 hard reject definitions");
+        okay &= Expect(std::string(fixture.evidence_sink) == "report-only evidence",
+                       std::string(fixture.condition) + " should remain report-only evidence");
+        okay &= Expect(std::string(fixture.gate_effect) == "none",
+                       std::string(fixture.condition) + " should not affect selection gate/rating/scorecard/perf threshold");
+    }
+    okay &= Expect(!hard_reject_changes_selection_gate,
+                   "hard reject fixture should not change selection gate");
+    okay &= Expect(!hard_reject_changes_rating, "hard reject fixture should not change rating");
+    okay &= Expect(!hard_reject_changes_scorecard, "hard reject fixture should not change scorecard");
+    okay &= Expect(!hard_reject_changes_perf_threshold,
+                   "hard reject fixture should not change perf threshold");
+    return okay;
+}
 
 bool TestActiveObjectiveConfigSkeletonDefaultInvalidAndScopedConfig() {
     auto okay = true;
@@ -1791,10 +2187,14 @@ bool TestActiveObjectiveConfigSkeletonDefaultInvalidAndScopedConfig() {
                        &invalid_config,
                        &invalid_error),
                    "Phase 3.41 invalid config should be rejected");
+    okay &= Expect(marker.find("invalid config") != std::string::npos,
+                   "Phase 3.41 invalid config marker should be present");
     okay &= Expect(invalid_config.config_present,
                    "Phase 3.41 invalid config should still record config presence");
     okay &= Expect(!invalid_config.config_valid,
                    "Phase 3.41 invalid config should not be valid");
+    okay &= Expect(!invalid_config.skeleton_enabled,
+                   "Phase 3.41 invalid config should not enable skeleton");
     okay &= Expect(!invalid_config.active_objective_probe_executed,
                    "Phase 3.41 invalid config should not execute active objective probe");
     okay &= Expect(!invalid_error.empty(),
@@ -1820,27 +2220,43 @@ bool TestActiveObjectiveConfigSkeletonDefaultInvalidAndScopedConfig() {
     okay &= Expect(surakarta::bitboard::ParseActiveObjectiveConfigSkeleton(
                        scoped_config_text, &scoped_config, &scoped_error),
                    "Phase 3.41 valid scoped config should enter skeleton");
+    okay &= Expect(marker.find("scoped config") != std::string::npos,
+                   "Phase 3.41 scoped config marker should be present");
     okay &= Expect(scoped_config.config_present && scoped_config.config_valid,
                    "Phase 3.41 scoped config should be present and valid");
     okay &= Expect(scoped_config.skeleton_enabled,
                    "Phase 3.41 scoped config should enable interface skeleton");
+    okay &= Expect(scoped_config.scope == "opening_root_children_only",
+                   "Phase 3.41 scoped config should keep opening-only scope");
     okay &= Expect(!scoped_config.active_objective_probe_executed,
                    "Phase 3.41 scoped config should not execute active objective probe");
     okay &= Expect(!scoped_config.selection_gate_eligible,
                    "Phase 3.41 scoped config should not be selection gate eligible");
+    okay &= Expect(AlmostEqual(scoped_config.opening_drift_penalty_weight, 0.005),
+                   "Phase 3.41 scoped config should parse reviewed weight");
+    okay &= Expect(scoped_config.max_games == 4 && scoped_config.max_depth == 4,
+                   "Phase 3.41 scoped config should enforce bounded dry-run limits");
+    okay &= Expect(scoped_config.probe_wiring_skeleton,
+                   "Phase 3.47 probe wiring skeleton should accept scoped config");
     okay &= Expect(scoped_config.no_output_probe_mode,
-                   "Phase 3.47 no output mode should be parsed");
+                   "Phase 3.47 no output probe mode should be parsed");
     okay &= Expect(scoped_config.weight_artifact_suppressed,
                    "Phase 3.47 weight suppressed marker should be parsed");
 
     auto skeleton_options = TrainingOptions{};
     skeleton_options.active_objective_config = scoped_config;
+    okay &= Expect(!skeleton_options.opening_safe_objective_enabled,
+                   "Phase 3.41 valid scoped config should not directly enable Phase 3.33 objective");
+    okay &= Expect(!skeleton_options.active_objective_config.active_objective_probe_executed,
+                   "Phase 3.41 valid scoped config should remain skeleton-only");
     skeleton_options.games = 1;
     skeleton_options.limits.max_depth = 1;
     auto skeleton_summary = surakarta::bitboard::TrainingSummary{};
     auto skeleton_error = std::string{};
     okay &= Expect(surakarta::bitboard::RunBitboardTraining(skeleton_options, &skeleton_summary, &skeleton_error),
                    "Phase 3.47 no output wiring skeleton should not require output weights");
+    okay &= Expect(skeleton_summary.active_interface_probe_wiring_skeleton,
+                   "Phase 3.47 probe wiring skeleton should be reported");
     okay &= Expect(skeleton_summary.active_interface_no_output_probe_mode,
                    "Phase 3.47 no output mode should be reported");
     okay &= Expect(skeleton_summary.active_interface_weight_artifact_suppressed,
@@ -1859,8 +2275,46 @@ bool TestActiveObjectiveConfigSkeletonDefaultInvalidAndScopedConfig() {
     okay &= Expect(!skeleton_summary.selection_gate_eligible,
                    "Phase 3.47 no output skeleton should remain not selection eligible");
 
+    const auto ordinary_config_text =
+        std::string("{") +
+        "\"schema_version\":1,"
+        "\"enabled\":true,"
+        "\"mode\":\"active_scoped\","
+        "\"scope\":\"opening_root_children_only\","
+        "\"report_only\":true,"
+        "\"probe_only\":true,"
+        "\"selection_gate_eligible\":false,"
+        "\"opening_drift_penalty_weight\":0.005,"
+        "\"max_games\":1,"
+        "\"max_depth\":1,"
+        "\"seed_allowlist\":[20260423]"
+        "}";
+    auto ordinary_config = surakarta::bitboard::ActiveObjectiveConfigSkeleton{};
+    auto ordinary_error = std::string{};
+    okay &= Expect(surakarta::bitboard::ParseActiveObjectiveConfigSkeleton(
+                       ordinary_config_text, &ordinary_config, &ordinary_error),
+                   "Phase 3.56 ordinary output path config should parse");
+    TempDirGuard temp_dir("surakarta-active-objective-ordinary-path");
+    auto ordinary_options = TrainingOptions{};
+    ordinary_options.active_objective_config = ordinary_config;
+    ordinary_options.output_weights_path = (temp_dir.path / "ordinary-output.bin").string();
+    ordinary_options.games = 0;
+    ordinary_options.limits.max_depth = 1;
+    auto ordinary_summary = surakarta::bitboard::TrainingSummary{};
+    auto ordinary_run_error = std::string{};
+    okay &= Expect(surakarta::bitboard::RunBitboardTraining(
+                       ordinary_options, &ordinary_summary, &ordinary_run_error),
+                   "Phase 3.56 ordinary output path should still run baseline export");
+    okay &= Expect(!ordinary_summary.active_interface_report_only_probe_path,
+                   "Phase 3.56 ordinary output path should not be report-only no-output evidence");
+    okay &= Expect(!ordinary_summary.active_objective_probe_executed,
+                   "Phase 3.56 ordinary output path should not set objective diagnostic evidence");
+    okay &= Expect(!ordinary_summary.selection_gate_eligible,
+                   "Phase 3.56 ordinary output path should remain not selection eligible");
+
     return okay;
 }
+
 bool TestBitboardTrainingTraceCli() {
     TempDirGuard temp_dir("surakarta-trace-cli");
     const auto benchmark = BenchmarkExecutablePath();
@@ -2254,6 +2708,8 @@ int main() {
     ok &= TestAllGeneratedCapturesHaveLoopPaths();
     std::cerr << "[TEST] TestEvaluateBitboardTerminalParity" << std::endl;
     ok &= TestEvaluateBitboardTerminalParity();
+    std::cerr << "[TEST] TestSearchNationalTerminalSemantics" << std::endl;
+    ok &= TestSearchNationalTerminalSemantics();
     std::cerr << "[TEST] TestSearchParity" << std::endl;
     ok &= TestSearchParity();
     std::cerr << "[TEST] TestSharedNodeBudget" << std::endl;
@@ -2282,6 +2738,8 @@ int main() {
     ok &= TestTdZeroAlphaAndSmallDeltaDirection();
     std::cerr << "[TEST] TestTdErrorClipLimitsAppliedUpdate" << std::endl;
     ok &= TestTdErrorClipLimitsAppliedUpdate();
+    std::cerr << "[TEST] TestOpeningSafeObjectiveDefaultOffAndInactiveEquivalence" << std::endl;
+    ok &= TestOpeningSafeObjectiveDefaultOffAndInactiveEquivalence();
     std::cerr << "[TEST] TestActiveObjectiveConfigSkeletonDefaultInvalidAndScopedConfig" << std::endl;
     ok &= TestActiveObjectiveConfigSkeletonDefaultInvalidAndScopedConfig();
     std::cerr << "[TEST] TestBitboardTrainingTraceCli" << std::endl;

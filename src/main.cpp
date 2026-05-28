@@ -330,23 +330,19 @@ std::string BitboardColorName(surakarta::bitboard::Color color) {
 }
 
 bool IsTraceTerminalPosition(const surakarta::bitboard::Position& position) {
-    const auto side = position.SideToMove();
-    const auto enemy = side == surakarta::bitboard::Color::Black
-                           ? surakarta::bitboard::Color::White
-                           : surakarta::bitboard::Color::Black;
-    return position.board.Count(side) == 0 ||
-           position.board.Count(enemy) == 0 ||
-           position.no_capture_ply >= position.max_no_capture_round;
+    return position.board.Count(surakarta::bitboard::Color::Black) == 0 ||
+           position.board.Count(surakarta::bitboard::Color::White) == 0 ||
+           surakarta::bitboard::IsNationalStalemateTerminal(position);
 }
 
 std::string TraceTerminalReason(const surakarta::bitboard::Position& next,
                                 const surakarta::bitboard::TrainingStepContext& context) {
-    if (next.no_capture_ply >= next.max_no_capture_round) {
-        return "no_capture_limit";
-    }
     if (next.board.Count(surakarta::bitboard::Color::Black) == 0 ||
         next.board.Count(surakarta::bitboard::Color::White) == 0) {
         return "terminal";
+    }
+    if (surakarta::bitboard::IsNationalStalemateTerminal(next)) {
+        return "both_sides_cannot_capture";
     }
     if (!context.next_has_legal_moves) {
         return "no_legal_move";
@@ -870,6 +866,15 @@ void PrintTrainingSummary(const surakarta::bitboard::TrainingSummary& summary, O
                   << "\"max_abs_td_error\":" << FormatDouble(summary.max_abs_td_error) << ","
                   << "\"average_abs_weight_delta\":" << FormatDouble(summary.average_abs_weight_delta) << ","
                   << "\"max_abs_weight_delta\":" << FormatDouble(summary.max_abs_weight_delta) << ","
+                  << "\"opening_safe_objective_enabled\":" << BoolJson(summary.opening_safe_objective_enabled) << ","
+                  << "\"opening_drift_penalty_active\":" << BoolJson(summary.opening_drift_penalty_active) << ","
+                  << "\"opening_drift_penalty_value\":" << FormatDouble(summary.opening_drift_penalty_value) << ","
+                  << "\"opening_drift_penalty_scope_status\":\""
+                  << EscapeJsonString(summary.opening_drift_penalty_scope_status) << "\","
+                  << "\"inactive_path_equivalent\":" << BoolJson(summary.inactive_path_equivalent) << ","
+                  << "\"hard_reject_triggered\":" << BoolJson(summary.hard_reject_triggered) << ","
+                  << "\"hard_reject_reasons\":["
+                  << "],"
                   << "\"active_interface_config_present\":" << BoolJson(summary.active_interface_config_present) << ","
                   << "\"active_interface_config_valid\":" << BoolJson(summary.active_interface_config_valid) << ","
                   << "\"active_interface_skeleton_enabled\":" << BoolJson(summary.active_interface_skeleton_enabled) << ","
@@ -887,7 +892,6 @@ void PrintTrainingSummary(const surakarta::bitboard::TrainingSummary& summary, O
                   << "\"selection_gate_eligible\":" << BoolJson(summary.selection_gate_eligible) << ","
                   << "\"active_interface_config_status\":\""
                   << EscapeJsonString(summary.active_interface_config_status) << "\","
-
                   << "\"checkpoint_count\":" << summary.checkpoint_count << ","
                   << "\"checkpoint_summaries\":[";
         for (std::size_t i = 0; i < summary.checkpoint_summaries.size(); ++i) {
@@ -944,6 +948,12 @@ void PrintTrainingSummary(const surakarta::bitboard::TrainingSummary& summary, O
     std::cout << "max_abs_td_error: " << summary.max_abs_td_error << std::endl;
     std::cout << "average_abs_weight_delta: " << summary.average_abs_weight_delta << std::endl;
     std::cout << "max_abs_weight_delta: " << summary.max_abs_weight_delta << std::endl;
+    std::cout << "opening_safe_objective_enabled: " << BoolJson(summary.opening_safe_objective_enabled) << std::endl;
+    std::cout << "opening_drift_penalty_active: " << BoolJson(summary.opening_drift_penalty_active) << std::endl;
+    std::cout << "opening_drift_penalty_value: " << summary.opening_drift_penalty_value << std::endl;
+    std::cout << "opening_drift_penalty_scope_status: " << summary.opening_drift_penalty_scope_status << std::endl;
+    std::cout << "inactive_path_equivalent: " << BoolJson(summary.inactive_path_equivalent) << std::endl;
+    std::cout << "hard_reject_triggered: " << BoolJson(summary.hard_reject_triggered) << std::endl;
     std::cout << "active_interface_config_present: " << BoolJson(summary.active_interface_config_present) << std::endl;
     std::cout << "active_interface_config_valid: " << BoolJson(summary.active_interface_config_valid) << std::endl;
     std::cout << "active_interface_skeleton_enabled: "

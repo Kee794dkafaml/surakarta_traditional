@@ -314,6 +314,14 @@ struct TrainingOptions {
     std::uint32_t seed{20260423};
     int checkpoint_every{0};
     std::string checkpoint_dir;
+    bool opening_safe_objective_enabled = false;
+    double opening_drift_penalty_weight{0.0};
+    int opening_drift_penalty_max_ply_window{0};
+    std::string opening_drift_penalty_root_case_id;
+    bool opening_drift_penalty_emit_diagnostics = false;
+    double opening_drift_penalty_unsafe_rank_degradation{0.0};
+    double opening_drift_penalty_root_cost_multiplier{0.0};
+    bool opening_drift_penalty_hard_reject = false;
     std::string active_objective_config_path;
     ActiveObjectiveConfigSkeleton active_objective_config{};
 };
@@ -330,6 +338,11 @@ struct TrainingStepResult {
     double abs_weight_delta{0.0};
     std::uint64_t changed_weight_count{0};
     bool terminal_target{false};
+    bool opening_drift_penalty_active = false;
+    double opening_drift_penalty_value{0.0};
+    std::string opening_drift_penalty_scope_status{"inactive"};
+    bool hard_reject_triggered = false;
+    bool selection_gate_eligible = false;
 };
 
 struct TrainingCheckpointSummary {
@@ -348,6 +361,13 @@ struct TrainingCheckpointSummary {
     double max_abs_td_error{0.0};
     double average_abs_weight_delta{0.0};
     double max_abs_weight_delta{0.0};
+    bool opening_safe_objective_enabled = false;
+    bool opening_drift_penalty_active = false;
+    double opening_drift_penalty_value{0.0};
+    std::string opening_drift_penalty_scope_status{"inactive"};
+    bool inactive_path_equivalent = true;
+    bool hard_reject_triggered = false;
+    std::vector<std::string> hard_reject_reasons{};
 };
 
 struct TrainingSummary {
@@ -379,6 +399,13 @@ struct TrainingSummary {
     int checkpoint_count{0};
     std::vector<TrainingCheckpointSummary> checkpoint_summaries{};
     std::string output_weights_path;
+    bool opening_safe_objective_enabled = false;
+    bool opening_drift_penalty_active = false;
+    double opening_drift_penalty_value{0.0};
+    std::string opening_drift_penalty_scope_status{"inactive"};
+    bool inactive_path_equivalent = true;
+    bool hard_reject_triggered = false;
+    std::vector<std::string> hard_reject_reasons{};
     bool active_interface_config_present = false;
     bool active_interface_config_valid = false;
     bool active_interface_skeleton_enabled = false;
@@ -458,7 +485,8 @@ bool ApplyTrainingStep(NTupleWeights& weights,
                        double lambda,
                        TrainingStepResult* result = nullptr,
                        double terminal_reward = 1200.0,
-                       double td_error_clip = 0.0);
+                       double td_error_clip = 0.0,
+                       const TrainingOptions& options = TrainingOptions{});
 bool RunBitboardTraining(const TrainingOptions& options,
                          TrainingSummary* summary,
                          std::string* error_message = nullptr);

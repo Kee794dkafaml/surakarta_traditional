@@ -10,36 +10,6 @@ using surakarta::bitboard::PositionAdapter;
 using surakarta::bitboard::PositionBuilder;
 using surakarta::bitboard::ToLegacyColor;
 
-namespace {
-
-surakarta::bitboard::Color Opponent(surakarta::bitboard::Color color) {
-    return color == surakarta::bitboard::Color::Black
-               ? surakarta::bitboard::Color::White
-               : surakarta::bitboard::Color::Black;
-}
-
-surakarta::bitboard::Position BuildJudgeEndPosition(const SurakartaBoard& board,
-                                                    const SurakartaGameInfo& game_info,
-                                                    const SurakartaIllegalMoveReason reason) {
-    auto position = PositionBuilder::FromLegacy(board, game_info);
-    const auto current = surakarta::bitboard::ToBitboardColor(game_info.current_player_);
-    const auto enemy = Opponent(current);
-
-    if (reason == SurakartaIllegalMoveReason::LEGAL_CAPTURE_MOVE) {
-        auto enemy_pieces = position.board.Pieces(enemy);
-        if (enemy_pieces != 0) {
-            const auto captured = static_cast<surakarta::bitboard::Square>(std::countr_zero(enemy_pieces));
-            position.board.ClearSquare(captured);
-        }
-        position.no_capture_ply = 0;
-    } else if (reason == SurakartaIllegalMoveReason::LEGAL_NON_CAPTURE_MOVE) {
-        position.no_capture_ply = static_cast<std::uint16_t>(position.no_capture_ply + 1);
-    }
-    return position;
-}
-
-}  // namespace
-
 std::pair<SurakartaEndReason, SurakartaPlayer> EvaluateBitboardTerminal(const surakarta::bitboard::Position& position) {
     const auto black_count = position.board.Count(surakarta::bitboard::Color::Black);
     const auto white_count = position.board.Count(surakarta::bitboard::Color::White);
@@ -51,7 +21,7 @@ std::pair<SurakartaEndReason, SurakartaPlayer> EvaluateBitboardTerminal(const su
         return {SurakartaEndReason::CHECKMATE, SurakartaPlayer::BLACK};
     }
 
-    if (position.no_capture_ply > position.max_no_capture_round) {
+    if (surakarta::bitboard::IsNationalStalemateTerminal(position)) {
         if (black_count > white_count) {
             return {SurakartaEndReason::STALEMATE, SurakartaPlayer::BLACK};
         }
@@ -119,7 +89,7 @@ std::pair<SurakartaEndReason, SurakartaPlayer> SurakartaRuleManagerBitboard::Jud
         return std::pair(SurakartaEndReason::ILLIGAL_MOVE, oppo_colour);
     }
 
-    const auto position = BuildJudgeEndPosition(*board_, *game_info_, reason);
+    const auto position = PositionBuilder::FromLegacy(*board_, *game_info_);
     return EvaluateBitboardTerminal(position);
 }
 

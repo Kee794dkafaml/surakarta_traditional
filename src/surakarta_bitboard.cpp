@@ -513,6 +513,45 @@ bool HasAnyLegalMove(const Position& position) {
     return move_list.size > 0;
 }
 
+bool HasAnyCaptureMove(const Position& position, Color color) {
+    if (color == Color::None) {
+        return false;
+    }
+
+    const auto enemy = color == Color::Black ? Color::White : Color::Black;
+    Bitboard pieces = position.board.Pieces(color);
+    const auto& tables = GetBitboardTables();
+
+    while (pieces != 0) {
+        const auto from = PopLsb(pieces);
+        Bitboard capture_targets = position.board.Pieces(enemy) & tables.capture_target_mask[from];
+        while (capture_targets != 0) {
+            const auto to = PopLsb(capture_targets);
+            if (IsCaptureLegal(position, from, to)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool HasAnyCaptureMove(const Position& position) {
+    return HasAnyCaptureMove(position, position.SideToMove());
+}
+
+bool IsNationalStalemateTerminal(const Position& position) {
+    const auto black_count = position.board.Count(Color::Black);
+    const auto white_count = position.board.Count(Color::White);
+    if (black_count == 0 || white_count == 0) {
+        return false;
+    }
+    if (black_count == kInitialPiecesPerSide && white_count == kInitialPiecesPerSide) {
+        return false;
+    }
+    return !HasAnyCaptureMove(position, Color::Black) &&
+           !HasAnyCaptureMove(position, Color::White);
+}
+
 bool HasAnyQuietMove(const Position& position) {
     auto move_list = MoveList{};
     GenerateMoves(position, move_list, false);

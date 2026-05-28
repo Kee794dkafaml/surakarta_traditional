@@ -298,12 +298,17 @@ void SurakartaApplyMoveUtil::RevertMove() {
 
 void SurakartaApplyMoveWithGameInfoUtil::ApplyMove(const SurakartaMove& move) {
     const bool is_capture = (*board_)[move.to.x][move.to.y]->GetColor() != PieceColor::NONE;
+    apply_move_util_.ApplyMove(move);
+
+    const auto move_reason = is_capture
+                                 ? SurakartaIllegalMoveReason::LEGAL_CAPTURE_MOVE
+                                 : SurakartaIllegalMoveReason::LEGAL_NON_CAPTURE_MOVE;
+    SurakartaRuleManagerImpl rule_manager(board_, game_info_);
+    const auto [end_reason, winner] = rule_manager.JudgeEnd(move_reason);
+
     if (is_capture) {
         game_info_->last_captured_round_ = game_info_->num_round_;
     }
-    SurakartaRuleManagerImpl rule_manager(board_, game_info_);
-    const auto [end_reason, winner] = rule_manager.JudgeEnd(
-        is_capture ? SurakartaIllegalMoveReason::LEGAL_CAPTURE_MOVE : SurakartaIllegalMoveReason::LEGAL_NON_CAPTURE_MOVE);
     if (!IsEndReason(end_reason)) {
         game_info_->current_player_ = ReverseColor(game_info_->current_player_);
         game_info_->num_round_++;
@@ -311,7 +316,6 @@ void SurakartaApplyMoveWithGameInfoUtil::ApplyMove(const SurakartaMove& move) {
         game_info_->end_reason_ = end_reason;
         game_info_->winner_ = winner;
     }
-    apply_move_util_.ApplyMove(move);
 }
 
 void SurakartaApplyMoveWithGameInfoUtil::RevertMove() {

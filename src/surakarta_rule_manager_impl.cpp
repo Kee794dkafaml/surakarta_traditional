@@ -58,32 +58,31 @@ std::pair<SurakartaEndReason, SurakartaPlayer> SurakartaRuleManagerImpl::JudgeEn
     if (IsLegalMoveReason(reason) == false)
         return std::pair(SurakartaEndReason::ILLIGAL_MOVE, oppo_colour);
 
-    int curr_remain = 0;
-    int oppo_remain = 0;
+    int black_remain = 0;
+    int white_remain = 0;
     for (const auto& column : *board_) {
         for (const auto& piece : column) {
-            if (piece->GetColor() == curr_colour)
-                curr_remain++;
-            if (piece->GetColor() == oppo_colour)
-                oppo_remain++;
+            if (piece->GetColor() == PieceColor::BLACK)
+                black_remain++;
+            if (piece->GetColor() == PieceColor::WHITE)
+                white_remain++;
         }
     }
-    if (reason == SurakartaIllegalMoveReason::LEGAL_CAPTURE_MOVE)
-        oppo_remain -= 1;
 
-    int last_capture_round = reason != SurakartaIllegalMoveReason::LEGAL_CAPTURE_MOVE
-                                 ? game_info_->last_captured_round_
-                                 : game_info_->num_round_;
+    if (black_remain == 0)
+        return std::pair(SurakartaEndReason::CHECKMATE, PieceColor::WHITE);
+    if (white_remain == 0)
+        return std::pair(SurakartaEndReason::CHECKMATE, PieceColor::BLACK);
 
-    // Current player has already made a move, so we only need to check whether the opponent has any piece or is movable.
-    if (oppo_remain == 0)
-        return std::pair(SurakartaEndReason::CHECKMATE, curr_colour);
-
-    if (game_info_->num_round_ - last_capture_round >= game_info_->max_no_capture_round_) {
-        if (curr_remain > oppo_remain)
-            return std::pair(SurakartaEndReason::STALEMATE, curr_colour);
-        else if (curr_remain < oppo_remain)
-            return std::pair(SurakartaEndReason::STALEMATE, oppo_colour);
+    const bool material_has_changed = black_remain < BOARD_SIZE * 2 || white_remain < BOARD_SIZE * 2;
+    const auto capture_util = SurakartaPieceCanCaptureUtil(board_);
+    if (material_has_changed &&
+        !capture_util.CanCaptureOpponentPiece(PieceColor::BLACK) &&
+        !capture_util.CanCaptureOpponentPiece(PieceColor::WHITE)) {
+        if (black_remain > white_remain)
+            return std::pair(SurakartaEndReason::STALEMATE, PieceColor::BLACK);
+        else if (black_remain < white_remain)
+            return std::pair(SurakartaEndReason::STALEMATE, PieceColor::WHITE);
         else
             return std::pair(SurakartaEndReason::STALEMATE, SurakartaPlayer::NONE);
     }

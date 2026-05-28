@@ -20,6 +20,7 @@ constexpr int kMoveListCapacity = 512;
 constexpr int kMaxCaptureVariants = SURAKARTA_CAPTURE_VARIANT_CAPACITY;
 static_assert(kMaxCaptureVariants > 0, "capture variant capacity must be positive");
 constexpr int kMaxPly = 64;
+constexpr int kInitialPiecesPerSide = kBoardSize * 2;
 constexpr std::uint8_t kInvalidSquare = 0xFF;
 
 using Bitboard = std::uint64_t;
@@ -235,6 +236,9 @@ std::vector<SurakartaMovePathFragment> ReconstructCapturePath(const Position& po
 void GenerateMoves(const Position& position, MoveList& move_list, bool captures_only = false);
 bool HasAnyLegalMove(const Position& position);
 bool HasAnyQuietMove(const Position& position);
+bool HasAnyCaptureMove(const Position& position);
+bool HasAnyCaptureMove(const Position& position, Color color);
+bool IsNationalStalemateTerminal(const Position& position);
 void MakeMove(Position& position, Move move, Undo& undo);
 void UnmakeMove(Position& position, Move move, const Undo& undo);
 void MakeNullMove(Position& position, Undo& undo);
