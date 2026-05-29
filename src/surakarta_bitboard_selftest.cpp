@@ -36,6 +36,7 @@ using surakarta::bitboard::Bit;
 using surakarta::bitboard::DescribeLegalTargets;
 using surakarta::bitboard::MakeSquare;
 using surakarta::bitboard::Move;
+using surakarta::bitboard::MoveQuiet;
 using surakarta::bitboard::NTupleWeights;
 using surakarta::bitboard::PositionBuilder;
 using surakarta::bitboard::PositionAdapter;
@@ -1425,6 +1426,56 @@ bool TestMiddlegameRootBestMatchesReference() {
     return okay;
 }
 
+bool TestRootSearchStoresRootTranspositionEntry() {
+    const auto position = LoadPositionFromFile(std::string(BITBOARD_TEST_DATA_DIR) + "\\game6.txt");
+
+    SearchController controller;
+    SearchLimits limits;
+    limits.max_depth = 6;
+    limits.threads = 1;
+    limits.aspiration_window = 1'000'000;
+
+    const auto before = controller.Table().Probe(position.zobrist_key);
+    const auto result = controller.Search(position, limits);
+    const auto after = controller.Table().Probe(position.zobrist_key);
+
+    auto okay = true;
+    okay &= Expect(!before.found, "fresh controller should not start with a root tt entry");
+    okay &= Expect(result.best_move.IsValid(), "root tt store test requires a legal completed search result");
+    okay &= Expect(after.found, "completed forced root search should store a root tt entry for retry ordering");
+    if (after.found) {
+        okay &= Expect(after.entry.depth >= limits.max_depth,
+                       "root tt entry should preserve completed root depth");
+        okay &= Expect(after.entry.bound == surakarta::bitboard::TTBound::Exact,
+                       "root tt entry should preserve the completed root exact bound");
+        okay &= Expect(EqualMove(after.entry.best_move, result.best_move),
+                       "root tt entry best move should match completed root best move");
+    }
+    return okay;
+}
+
+bool TestLmrMicroTuneDelaysFirstQuietReduction() {
+    const auto position = LoadPositionFromFile(
+        std::string(BITBOARD_TEST_DATA_DIR) + "\\screenshot_2026_05_06_same_file_capture.txt");
+
+    SearchController controller;
+    SearchLimits limits;
+    limits.max_depth = 6;
+    limits.threads = 1;
+    limits.aspiration_window = 1;
+
+    const auto result = controller.Search(position, limits);
+
+    auto okay = true;
+    okay &= Expect(EqualMove(result.best_move, Move{MakeSquare(5, 1), MakeSquare(5, 2), MoveQuiet, 0}),
+                   "LMR micro tune marker should preserve screenshot depth-6 best move");
+    okay &= Expect(result.score == -142,
+                   "LMR micro tune marker should preserve screenshot depth-6 score");
+    okay &= Expect(result.stats.lmr_reductions < 149,
+                   "LMR micro tune should delay the first quiet reduction compared with P1");
+    return okay;
+}
+
 bool TestBenchmarkJsonOutput() {
     const auto benchmark = BenchmarkExecutablePath();
     const auto file_name = std::string(BITBOARD_TEST_DATA_DIR) + "\\game1.txt";
@@ -1446,6 +1497,34 @@ bool TestBenchmarkJsonOutput() {
     okay &= Expect(benchmark_exit == 0, "bitboard-benchmark --format json should exit successfully");
     okay &= ExpectJsonReportShape(search_output, "middlegame", "bitboard-search json output");
     okay &= ExpectJsonReportShape(benchmark_output, "middlegame", "bitboard-benchmark json output");
+    return okay;
+}
+
+bool TestBenchmarkApplyMoveJsonOutput() {
+    const auto benchmark = BenchmarkExecutablePath();
+    const auto file_name = std::string(BITBOARD_TEST_DATA_DIR) + "\\game6.txt";
+    TempDirGuard temp_dir("surakarta-apply-move-cli");
+    const auto next_file = temp_dir.path / "next.txt";
+
+    auto output = std::string{};
+    const auto command = QuoteCommandArg(benchmark.string()) +
+                         " bitboard-apply-move --file " + QuoteCommandArg(file_name) +
+                         " --move 5,1,1,1,B" +
+                         " --output " + QuoteCommandArg(next_file.string()) +
+                         " --format json";
+    const auto exit_code = RunCommandCapture(command, &output);
+
+    auto okay = true;
+    okay &= Expect(exit_code == 0, "bitboard-apply-move should accept a legal move");
+    okay &= Expect(std::filesystem::exists(next_file), "bitboard-apply-move should write next position file");
+    okay &= Expect(!output.empty(), "bitboard-apply-move should emit json output");
+    okay &= Expect(output.front() == '{', "bitboard-apply-move json output should start with an object");
+    okay &= Expect(output.find("\"legal\":true") != std::string::npos,
+                   "bitboard-apply-move json output should mark legal move");
+    okay &= Expect(output.find("\"move_reason\":\"LEGAL_CAPTURE_MOVE\"") != std::string::npos,
+                   "bitboard-apply-move json output should include move reason");
+    okay &= Expect(ReadFileBinary(next_file).find("winner: B") != std::string::npos,
+                   "bitboard-apply-move should persist terminal winner");
     return okay;
 }
 
@@ -2268,8 +2347,14 @@ int main() {
     ok &= TestAspirationStatsAndSnapshotPv();
     std::cerr << "[TEST] TestMiddlegameRootBestMatchesReference" << std::endl;
     ok &= TestMiddlegameRootBestMatchesReference();
+    std::cerr << "[TEST] TestRootSearchStoresRootTranspositionEntry" << std::endl;
+    ok &= TestRootSearchStoresRootTranspositionEntry();
+    std::cerr << "[TEST] TestLmrMicroTuneDelaysFirstQuietReduction" << std::endl;
+    ok &= TestLmrMicroTuneDelaysFirstQuietReduction();
     std::cerr << "[TEST] TestBenchmarkJsonOutput" << std::endl;
     ok &= TestBenchmarkJsonOutput();
+    std::cerr << "[TEST] TestBenchmarkApplyMoveJsonOutput" << std::endl;
+    ok &= TestBenchmarkApplyMoveJsonOutput();
     std::cerr << "[TEST] TestWeightRoundTrip" << std::endl;
     ok &= TestWeightRoundTrip();
     std::cerr << "[TEST] TestTdTerminalRewardSigns" << std::endl;

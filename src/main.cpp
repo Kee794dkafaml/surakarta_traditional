@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cmath>
 #include <climits>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -1193,6 +1194,134 @@ int RunBitboardBenchmarkCommand(int argc, char** argv) {
                                      options.format);
 }
 
+bool ParseLegacyMoveText(const std::string& text, SurakartaMove* move) {
+    int from_x = 0;
+    int from_y = 0;
+    int to_x = 0;
+    int to_y = 0;
+    char player = '\0';
+    const auto legacy_count = std::sscanf(text.c_str(),
+                                          " ( %d , %d ) -> ( %d , %d ) ( %c ) ",
+                                          &from_x,
+                                          &from_y,
+                                          &to_x,
+                                          &to_y,
+                                          &player);
+    const auto compact_count = legacy_count == 5
+                                   ? 5
+                                   : std::sscanf(text.c_str(),
+                                                 " %d , %d , %d , %d , %c ",
+                                                 &from_x,
+                                                 &from_y,
+                                                 &to_x,
+                                                 &to_y,
+                                                 &player);
+    if (compact_count != 5) {
+        return false;
+    }
+
+    auto color = PieceColor::NONE;
+    if (player == 'B') {
+        color = PieceColor::BLACK;
+    } else if (player == 'W') {
+        color = PieceColor::WHITE;
+    } else {
+        return false;
+    }
+    *move = SurakartaMove(from_x, from_y, to_x, to_y, color);
+    return true;
+}
+
+void PrintApplyMoveReport(const std::string& input_file,
+                          const std::string& output_file,
+                          const std::string& move_text,
+                          const SurakartaMoveResponse& response,
+                          const SurakartaGame& game,
+                          OutputFormat format) {
+    const auto game_info = game.GetGameInfo();
+    if (format == OutputFormat::Json) {
+        std::cout << "{"
+                  << "\"input_file\":\"" << EscapeJsonString(input_file) << "\","
+                  << "\"output_file\":\"" << EscapeJsonString(output_file) << "\","
+                  << "\"move\":\"" << EscapeJsonString(move_text) << "\","
+                  << "\"legal\":" << BoolJson(response.IsLegal()) << ","
+                  << "\"move_reason\":\"" << EscapeJsonString(SurakartaToString(response.GetMoveReason())) << "\","
+                  << "\"end\":" << BoolJson(response.IsEnd()) << ","
+                  << "\"end_reason\":\"" << EscapeJsonString(SurakartaToString(response.GetEndReason())) << "\","
+                  << "\"winner\":\"" << EscapeJsonString(SurakartaToString(response.GetWinner())) << "\","
+                  << "\"next_player\":\"" << EscapeJsonString(SurakartaToString(game_info->current_player_)) << "\","
+                  << "\"num_round\":" << game_info->num_round_ << ","
+                  << "\"last_captured_round\":" << game_info->last_captured_round_ << ","
+                  << "\"max_no_capture_round\":" << game_info->max_no_capture_round_
+                  << "}" << std::endl;
+        return;
+    }
+
+    std::cout << "input_file: " << input_file << std::endl;
+    std::cout << "output_file: " << output_file << std::endl;
+    std::cout << "move: " << move_text << std::endl;
+    std::cout << "legal: " << BoolJson(response.IsLegal()) << std::endl;
+    std::cout << "move_reason: " << response.GetMoveReason() << std::endl;
+    std::cout << "end: " << BoolJson(response.IsEnd()) << std::endl;
+    std::cout << "end_reason: " << response.GetEndReason() << std::endl;
+    std::cout << "winner: " << response.GetWinner() << std::endl;
+    std::cout << "next_player: " << game_info->current_player_ << std::endl;
+}
+
+int RunBitboardApplyMoveCommand(int argc, char** argv) {
+    auto input_file = std::string{};
+    auto output_file = std::string{};
+    auto move_text = std::string{};
+    auto format = OutputFormat::Text;
+
+    for (int i = 0; i < argc; ++i) {
+        if (strcmp(argv[i], "--file") == 0 || strcmp(argv[i], "-f") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return 1;
+            }
+            input_file = argv[i];
+        } else if (strcmp(argv[i], "--output") == 0 || strcmp(argv[i], "-o") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return 1;
+            }
+            output_file = argv[i];
+        } else if (strcmp(argv[i], "--move") == 0 || strcmp(argv[i], "-m") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return 1;
+            }
+            move_text = argv[i];
+        } else if (strcmp(argv[i], "--format") == 0 || strcmp(argv[i], "-F") == 0) {
+            if (!RequireValue(argc, argv, &i, argv[i - 0])) {
+                return 1;
+            }
+            format = std::string(argv[i]) == "json" ? OutputFormat::Json : OutputFormat::Text;
+        } else {
+            std::cerr << "Unknown option: " << argv[i] << std::endl;
+            return 1;
+        }
+    }
+
+    if (move_text.empty()) {
+        std::cerr << "bitboard-apply-move requires --move" << std::endl;
+        return 1;
+    }
+
+    auto move = SurakartaMove{};
+    if (!ParseLegacyMoveText(move_text, &move)) {
+        std::cerr << "failed to parse move: " << move_text << std::endl;
+        return 1;
+    }
+
+    auto game = SurakartaGame{};
+    game.StartGame(input_file);
+    const auto response = game.Move(move);
+    if (response.IsLegal() && !output_file.empty()) {
+        game.SaveGame(output_file);
+    }
+    PrintApplyMoveReport(input_file, output_file, move_text, response, game, format);
+    return response.IsLegal() ? 0 : 2;
+}
+
 bool ParseBitboardTraceOptions(int argc, char** argv, BitboardTraceOptions* options) {
     for (int i = 0; i < argc; ++i) {
         if (strcmp(argv[i], "--weights") == 0 || strcmp(argv[i], "-w") == 0) {
@@ -1578,6 +1707,7 @@ void PrintUsage(const char* executable) {
     std::cout << "Usage: " << executable << " play [args..] [--delay|-D <delay>]" << std::endl;
     std::cout << "       " << executable << " bitboard-search [args..] [--file|-f <board-file>]" << std::endl;
     std::cout << "       " << executable << " bitboard-benchmark [args..] [--movegen-iters|-m <count>]" << std::endl;
+    std::cout << "       " << executable << " bitboard-apply-move --move <move> [--file <board-file>] [--output <board-file>]" << std::endl;
     std::cout << "       " << executable << " bitboard-trace [--games|-g <n>] [--seed <n>] [--format json|csv]" << std::endl;
     std::cout << "       " << executable << " bitboard-train --output|-o <weights.bin> [args..]" << std::endl;
     std::cout << "       " << executable << " bitboard-eval --candidate <weights.bin> [args..]" << std::endl;
@@ -1592,6 +1722,7 @@ void PrintUsage(const char* executable) {
     std::cout << "  --movegen-iters|-m  Move generation iterations for bitboard-benchmark, default: 100000" << std::endl;
     std::cout << "  --format|-F <mode>  Output format: text or json, default: text" << std::endl;
     std::cout << "  --case-id|-c <id>   Optional report case identifier, default: opening or file stem" << std::endl;
+    std::cout << "  bitboard-apply-move args: --file|-f --move|-m --output|-o --format|-F" << std::endl;
     std::cout << "  --search-diagnostics Enable root/aspiration/qsearch diagnostic output for bitboard search commands" << std::endl;
     std::cout << "  bitboard-trace args: --weights|-w --games|-g --alpha --lambda --epsilon --epsilon-plies --terminal-reward --td-error-clip --terminal-only-warmup --near-terminal-curriculum --seed --format json|csv" << std::endl;
     std::cout << "  bitboard-train args: --weights|-w --games|-g --alpha --lambda --epsilon --epsilon-plies --terminal-reward --td-error-clip --terminal-only-warmup --near-terminal-curriculum --seed --checkpoint-every --checkpoint-dir --config" << std::endl;
@@ -1646,6 +1777,9 @@ int main(int argc, char** argv) {
     }
     if (command == "bitboard-benchmark") {
         return RunBitboardBenchmarkCommand(argc - 2, argv + 2);
+    }
+    if (command == "bitboard-apply-move") {
+        return RunBitboardApplyMoveCommand(argc - 2, argv + 2);
     }
     if (command == "bitboard-trace") {
         return RunBitboardTraceCommand(argc - 2, argv + 2);

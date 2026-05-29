@@ -338,9 +338,15 @@ constexpr std::uint64_t kNodeBatchSize = 128;
 constexpr double kTrainingWeightClamp = 4096.0;
 constexpr double kTrainingTerminalRewardDefault = 1200.0;
 constexpr int kTrainingMaxPlies = 256;
+constexpr int kRootTerminalScoreWindow = 256;
+constexpr int kLmrFirstQuietMoveIndex = 5;
 
 bool IsMateLikeScore(int score) {
     return std::abs(score) >= (kMateScore - kMaxPly - 1);
+}
+
+bool IsRootTerminalScore(int score) {
+    return std::abs(score) >= (kMateScore - kRootTerminalScoreWindow);
 }
 
 struct TupleDescriptor {
@@ -1006,7 +1012,7 @@ struct WorkerContext {
                 !pv_node &&
                 !move.IsCapture() &&
                 depth >= 3 &&
-                i >= 4 &&
+                i >= kLmrFirstQuietMoveIndex &&
                 !SameMove(move, killer[ply][0]) &&
                 !SameMove(move, tt_move)) {
                 reduction = 1;
@@ -1946,6 +1952,9 @@ SearchResult SearchController::Search(const Position& root, const SearchLimits& 
                 diagnostic.qnodes = attempt_qnodes_after - attempt_qnodes_before;
                 diagnostic.root_best_updates = attempt_root_updates_after - attempt_root_updates_before;
                 shared->RecordAspirationDiagnostic(diagnostic);
+                if (depth_result.best_move.IsValid() && IsRootTerminalScore(depth_result.score)) {
+                    table_.Store(root.zobrist_key, depth, depth_result.score, TTBound::Exact, depth_result.best_move);
+                }
                 break;
             }
 
